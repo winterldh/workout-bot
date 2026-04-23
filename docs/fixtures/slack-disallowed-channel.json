@@ -1,0 +1,24 @@
+{
+  "type": "event_callback",
+  "team_id": "T_OTHER",
+  "authorizations": [
+    {
+      "team_id": "T_OTHER"
+    }
+  ],
+  "event": {
+    "type": "message",
+    "user": "U_OUTSIDE",
+    "channel": "C_OTHER",
+    "text": "#인증 외부 채널 테스트",
+    "ts": "1713146400.000300",
+    "client_msg_id": "msg-disallowed-checkin",
+    "username": "outside-user",
+    "files": [
+      {
+        "mimetype": "image/jpeg",
+        "url_private_download": "https://example.com/outside.jpg"
+      }
+    ]
+  }
+}

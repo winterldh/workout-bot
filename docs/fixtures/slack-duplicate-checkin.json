@@ -1,0 +1,24 @@
+{
+  "type": "event_callback",
+  "team_id": "T_WORKSPACE",
+  "authorizations": [
+    {
+      "team_id": "T_WORKSPACE"
+    }
+  ],
+  "event": {
+    "type": "message",
+    "user": "U_FIRST",
+    "channel": "C_CHECKIN",
+    "text": "#인증 저녁 운동도 완료",
+    "ts": "1713150000.000200",
+    "client_msg_id": "msg-duplicate-checkin",
+    "username": "first-user",
+    "files": [
+      {
+        "mimetype": "image/png",
+        "url_private_download": "https://example.com/checkin-2.png"
+      }
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "type": "event_callback",
+  "team_id": "T_WORKSPACE",
+  "authorizations": [
+    {
+      "team_id": "T_WORKSPACE"
+    }
+  ],
+  "event": {
+    "type": "message",
+    "user": "U_CHAT",
+    "channel": "C_CHECKIN",
+    "text": "오늘 운동했어요",
+    "ts": "1713146400.000400",
+    "client_msg_id": "msg-general-message",
+    "username": "chat-user"
+  }
+}

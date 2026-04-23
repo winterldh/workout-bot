@@ -1,0 +1,263 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MembershipRole {
+  MEMBER
+  ADMIN
+}
+
+enum IdentityProvider {
+  SLACK
+  WEB
+}
+
+enum SubmissionSourceType {
+  SLACK
+  WEB
+}
+
+enum CheckInRecordStatus {
+  APPROVED
+  REJECTED
+}
+
+enum GoalPeriodUnit {
+  HOUR
+  DAY
+  WEEK
+}
+
+enum GoalStatus {
+  DRAFT
+  ACTIVE
+  CLOSED
+  LOCKED
+}
+
+enum WeeklyReportRunStatus {
+  RUNNING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum SubmissionAssetKind {
+  IMAGE
+  VIDEO
+  FILE
+}
+
+model User {
+  id             String            @id @default(cuid())
+  displayName    String
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  identities     UserIdentity[]
+  memberships    GroupMembership[]
+  createdGroups  Group[]           @relation("GroupCreator")
+  submissions    RawSubmission[]
+  checkInRecords CheckInRecord[]
+  slackChangeCandidates SlackChangeCandidate[]
+}
+
+model Group {
+  id             String            @id @default(cuid())
+  name           String
+  slug           String            @unique
+  timezone       String            @default("Asia/Seoul")
+  creatorUserId  String
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  creator        User              @relation("GroupCreator", fields: [creatorUserId], references: [id])
+  memberships    GroupMembership[]
+  goals          Goal[]
+  slackIntegrations SlackIntegration[]
+  submissions    RawSubmission[]
+  checkInRecords CheckInRecord[]
+  slackChangeCandidates SlackChangeCandidate[]
+}
+
+model UserIdentity {
+  id                  String           @id @default(cuid())
+  userId              String
+  provider            IdentityProvider
+  providerUserId      String
+  providerWorkspaceId String?
+  providerUsername    String?
+  profile             Json?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+  user                User             @relation(fields: [userId], references: [id])
+  submissions         RawSubmission[]
+
+  @@unique([provider, providerUserId, providerWorkspaceId])
+  @@index([userId])
+}
+
+model GroupMembership {
+  id        String         @id @default(cuid())
+  userId    String
+  groupId   String
+  role      MembershipRole @default(MEMBER)
+  joinedAt  DateTime       @default(now())
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  user      User           @relation(fields: [userId], references: [id])
+  group     Group          @relation(fields: [groupId], references: [id])
+  rejectedCheckInRecords CheckInRecord[] @relation("RejectedByMembership")
+
+  @@unique([userId, groupId])
+  @@index([groupId, role])
+}
+
+model Goal {
+  id                String           @id @default(cuid())
+  groupId           String
+  title             String
+  status            GoalStatus       @default(DRAFT)
+  startsAt          DateTime
+  endsAt            DateTime
+  targetCount       Int
+  periodUnit        GoalPeriodUnit   @default(DAY)
+  periodValue       Int              @default(1)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  group             Group            @relation(fields: [groupId], references: [id])
+  slackIntegrations SlackIntegration[]
+  submissions       RawSubmission[]
+  checkInRecords    CheckInRecord[]
+  slackChangeCandidates SlackChangeCandidate[]
+
+  @@index([groupId, status])
+  @@index([groupId, startsAt, endsAt])
+}
+
+model SlackChangeCandidate {
+  id              String   @id @default(cuid())
+  groupId         String
+  goalId          String
+  userId          String
+  workspaceId     String
+  channelId       String
+  recordDate      DateTime
+  sourceMessageId String
+  blobUrl         String?
+  originalPhotoUrl String?
+  slackOriginalUrl String?
+  // legacy compatibility fields, kept until old readers are fully removed
+  imageUrl        String
+  submittedAt     DateTime
+  note            String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  group           Group    @relation(fields: [groupId], references: [id])
+  goal            Goal     @relation(fields: [goalId], references: [id])
+  user            User     @relation(fields: [userId], references: [id])
+
+  @@unique([workspaceId, channelId, userId, recordDate])
+  @@index([groupId, goalId, recordDate])
+}
+
+model SlackIntegration {
+  id                      String   @id @default(cuid())
+  groupId                 String
+  goalId                  String
+  workspaceId             String
+  channelId               String
+  botToken                String?
+  signingSecret           String?
+  autoJoinOnFirstCheckIn  Boolean  @default(true)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  group                   Group    @relation(fields: [groupId], references: [id])
+  goal                    Goal     @relation(fields: [goalId], references: [id])
+
+  @@unique([workspaceId, channelId])
+  @@index([groupId, goalId])
+}
+
+model RawSubmission {
+  id                   String               @id @default(cuid())
+  groupId              String
+  userId               String?
+  identityId           String?
+  goalId               String?
+  sourceType           SubmissionSourceType
+  externalSubmissionId String?
+  submittedAt          DateTime
+  note                 String?
+  rawPayload           Json?
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+  group                Group                @relation(fields: [groupId], references: [id])
+  user                 User?                @relation(fields: [userId], references: [id])
+  identity             UserIdentity?        @relation(fields: [identityId], references: [id])
+  goal                 Goal?                @relation(fields: [goalId], references: [id])
+  assets               SubmissionAsset[]
+  checkInRecords       CheckInRecord[]
+
+  @@unique([sourceType, externalSubmissionId])
+  @@index([groupId, submittedAt])
+}
+
+model SubmissionAsset {
+  id              String              @id @default(cuid())
+  rawSubmissionId String
+  kind            SubmissionAssetKind @default(IMAGE)
+  mimeType        String?
+  blobUrl         String?
+  originalPhotoUrl String?
+  slackOriginalUrl String?
+  // legacy compatibility field, kept for old dashboard/history readers
+  originalUrl     String?
+  storageKey      String?
+  metadata        Json?
+  createdAt       DateTime            @default(now())
+  rawSubmission   RawSubmission       @relation(fields: [rawSubmissionId], references: [id])
+
+  @@index([rawSubmissionId])
+}
+
+model WeeklyReportRun {
+  id         String               @id @default(cuid())
+  runKey     String               @unique
+  status     WeeklyReportRunStatus @default(RUNNING)
+  startedAt  DateTime             @default(now())
+  finishedAt DateTime?
+  error      String?
+  createdAt  DateTime             @default(now())
+  updatedAt  DateTime             @updatedAt
+}
+
+model CheckInRecord {
+  id                     String               @id @default(cuid())
+  groupId                String
+  userId                 String
+  goalId                 String
+  rawSubmissionId        String?
+  status                 CheckInRecordStatus  @default(APPROVED)
+  recordAt               DateTime
+  recordDate             DateTime
+  note                   String?
+  rejectedAt             DateTime?
+  rejectedReason         String?
+  rejectedByMembershipId String?
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+  group                  Group                @relation(fields: [groupId], references: [id])
+  user                   User                 @relation(fields: [userId], references: [id])
+  goal                   Goal                 @relation(fields: [goalId], references: [id])
+  rawSubmission          RawSubmission?       @relation(fields: [rawSubmissionId], references: [id])
+  rejectedByMembership   GroupMembership?     @relation("RejectedByMembership", fields: [rejectedByMembershipId], references: [id])
+
+  @@unique([goalId, userId, recordDate])
+  @@index([goalId, status, recordDate])
+  @@index([groupId, userId, recordDate])
+  @@index([rawSubmissionId])
+}
