@@ -35,6 +35,7 @@ vercel.json
 
 ```txt
 DATABASE_URL
+DIRECT_URL
 SLACK_SIGNING_SECRET
 SLACK_BOT_TOKEN
 BLOB_READ_WRITE_TOKEN
@@ -47,7 +48,7 @@ WEEKLY_PENALTY_TEXT
 SLACK_SIGNATURE_VERIFICATION_DISABLED
 ```
 
-`BLOB_READ_WRITE_TOKEN`은 Slack private file을 Vercel Blob에 저장할 때 필요합니다. `CRON_SECRET`은 주간 리포트 Cron 보호용입니다.
+`DATABASE_URL`은 앱 런타임용 Supabase Transaction pooler URI, `DIRECT_URL`은 Prisma migration용 Supabase Direct connection URI입니다. `BLOB_READ_WRITE_TOKEN`은 Slack private file을 Vercel Blob에 저장할 때 필요하고, `CRON_SECRET`은 주간 리포트 Cron 보호용입니다.
 
 ## 로컬 실행
 
@@ -77,6 +78,20 @@ vercel deploy
 ```
 
 Vercel Cron은 `vercel.json`의 `/api/cron/weekly-report`를 매주 월요일 10:00 KST에 실행하도록 설정되어 있습니다. `CRON_SECRET`을 설정하면 `Authorization: Bearer <CRON_SECRET>` 요청만 허용합니다.
+
+Supabase에서는 `Supabase Dashboard -> Project Settings -> Database -> Connect -> ORM` 탭에서 값을 복사합니다.
+
+- `DATABASE_URL`: Transaction pooler를 선택한 뒤 Connection string을 복사합니다.
+- `DIRECT_URL`: Direct connection을 선택한 뒤 Connection string을 복사합니다.
+
+마이그레이션 실행 전에는 터미널에서 아래처럼 환경변수를 넣고 실행합니다.
+
+```bash
+export DATABASE_URL="Transaction pooler connection string"
+export DIRECT_URL="Direct connection string"
+npx prisma migrate deploy
+npm run prisma:seed
+```
 
 ### Vercel 연결
 
