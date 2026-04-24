@@ -1,5 +1,6 @@
 import {
   CheckInRecordStatus,
+  MembershipRole,
   SubmissionAssetKind,
   SubmissionSourceType,
 } from '@prisma/client';
@@ -10,7 +11,7 @@ import {
   normalizeRecordDateToKst,
 } from '@/lib/domain/date';
 import { logEvent } from '@/lib/observability/logger';
-import { ensureSlackUserMembership } from '@/lib/services/users';
+import { getSlackRegistrationState } from '@/lib/services/users';
 
 export async function createFromSlackMessage(input: {
   externalSlackId: string;
@@ -53,6 +54,22 @@ export async function createFromSlackMessage(input: {
     return { status: 'ignored' as const, userCreated: false, membershipCreated: false, candidateSaved: false };
   }
 
+  const registrationState = await getSlackRegistrationState({
+    db: prisma,
+    workspaceId: input.workspaceId,
+    externalSlackId: input.externalSlackId,
+    groupId: integration.groupId,
+  });
+
+  if (!registrationState.isRegistered || !registrationState.user || !registrationState.identity) {
+    return {
+      status: 'registration_required' as const,
+      userCreated: false,
+      membershipCreated: false,
+      candidateSaved: false,
+    };
+  }
+
   const normalizedRecordDate = normalizeRecordDate(input.checkedAt, integration.group.timezone);
   logEvent('info', 'checkin.record_date_normalized', {
     eventType: 'slack_checkin',
@@ -68,14 +85,27 @@ export async function createFromSlackMessage(input: {
   });
 
   return prisma.$transaction(async (tx) => {
-    const ensured = await ensureSlackUserMembership({
-      tx,
-      workspaceId: input.workspaceId,
-      externalSlackId: input.externalSlackId,
-      displayName: input.displayName,
-      providerUsername: input.providerUsername,
-      groupId: integration.groupId,
+    const user = registrationState.user!;
+    const identity = registrationState.identity!;
+
+    const existingMembership = await tx.groupMembership.findUnique({
+      where: {
+        userId_groupId: {
+          userId: user.id,
+          groupId: integration.groupId,
+        },
+      },
     });
+
+    if (!existingMembership) {
+      await tx.groupMembership.create({
+        data: {
+          userId: user.id,
+          groupId: integration.groupId,
+          role: MembershipRole.MEMBER,
+        },
+      });
+    }
 
     const existingSubmission = await tx.rawSubmission.findUnique({
       where: {
@@ -90,8 +120,8 @@ export async function createFromSlackMessage(input: {
     if (existingSubmission) {
       return {
         status: 'duplicate' as const,
-        userCreated: ensured.userCreated,
-        membershipCreated: ensured.membershipCreated,
+        userCreated: false,
+        membershipCreated: !existingMembership,
         checkInId: existingSubmission.checkInRecords[0]?.id,
         candidateSaved: false,
       };
@@ -101,7 +131,7 @@ export async function createFromSlackMessage(input: {
       where: {
         goalId_userId_recordDate: {
           goalId: integration.goalId,
-          userId: ensured.user.id,
+          userId: user.id,
           recordDate: normalizedRecordDate,
         },
       },
@@ -117,14 +147,14 @@ export async function createFromSlackMessage(input: {
             workspaceId_channelId_userId_recordDate: {
               workspaceId: input.workspaceId,
               channelId: input.channelId,
-              userId: ensured.user.id,
+              userId: user.id,
               recordDate: normalizedRecordDate,
             },
           },
           create: {
             groupId: integration.groupId,
             goalId: integration.goalId,
-            userId: ensured.user.id,
+            userId: user.id,
             workspaceId: input.workspaceId,
             channelId: input.channelId,
             recordDate: normalizedRecordDate,
@@ -155,15 +185,15 @@ export async function createFromSlackMessage(input: {
           channelId: input.channelId,
           groupId: integration.groupId,
           goalId: integration.goalId,
-          slackUserId: ensured.user.id,
+          slackUserId: user.id,
           candidateId,
         });
       }
 
       return {
         status: 'duplicate' as const,
-        userCreated: ensured.userCreated,
-        membershipCreated: ensured.membershipCreated,
+        userCreated: false,
+        membershipCreated: !existingMembership,
         checkInId: duplicateRecord.id,
         candidateSaved,
         candidateId,
@@ -173,9 +203,9 @@ export async function createFromSlackMessage(input: {
     const rawSubmission = await tx.rawSubmission.create({
       data: {
         groupId: integration.groupId,
-        userId: ensured.user.id,
+        userId: user.id,
         goalId: integration.goalId,
-        identityId: ensured.identity.id,
+        identityId: identity.id,
         sourceType: SubmissionSourceType.SLACK,
         externalSubmissionId: input.sourceMessageId,
         submittedAt: input.checkedAt,
@@ -208,7 +238,7 @@ export async function createFromSlackMessage(input: {
     const checkIn = await tx.checkInRecord.create({
       data: {
         groupId: integration.groupId,
-        userId: ensured.user.id,
+        userId: user.id,
         goalId: integration.goalId,
         rawSubmissionId: rawSubmission.id,
         status: CheckInRecordStatus.APPROVED,
@@ -222,15 +252,15 @@ export async function createFromSlackMessage(input: {
       where: {
         workspaceId: input.workspaceId,
         channelId: input.channelId,
-        userId: ensured.user.id,
+        userId: user.id,
         recordDate: normalizedRecordDate,
       },
     });
 
     return {
       status: 'accepted' as const,
-      userCreated: ensured.userCreated,
-      membershipCreated: ensured.membershipCreated,
+      userCreated: false,
+      membershipCreated: !existingMembership,
       checkInId: checkIn.id,
       candidateSaved: false,
     };

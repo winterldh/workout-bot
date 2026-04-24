@@ -1,7 +1,6 @@
 import { CheckInRecordStatus, IdentityProvider } from '@prisma/client';
 import { getWeekRange } from '@/lib/domain/date';
 import { prisma } from '@/lib/prisma';
-import { fetchSlackUserProfile } from '@/lib/slack/client';
 
 export async function getCurrentStatus(input: {
   workspaceId: string;
@@ -25,12 +24,6 @@ export async function getCurrentStatus(input: {
   }
 
   await syncRequesterFallbackName(input);
-  await syncSlackMemberDisplayNames({
-    workspaceId: input.workspaceId,
-    groupId: integration.groupId,
-    token: process.env.SLACK_BOT_TOKEN ?? integration.botToken ?? undefined,
-  });
-
   const range = getWeekRange(input.now ?? new Date(), integration.group.timezone);
 
   const [checkIns, meIdentity, memberships] = await Promise.all([
@@ -196,52 +189,4 @@ async function syncRequesterFallbackName(input: {
       });
     }
   });
-}
-
-async function syncSlackMemberDisplayNames(input: {
-  workspaceId: string;
-  groupId: string;
-  token?: string;
-}) {
-  if (!input.token) {
-    return;
-  }
-
-  const identities = await prisma.userIdentity.findMany({
-    where: {
-      provider: IdentityProvider.SLACK,
-      providerWorkspaceId: input.workspaceId,
-      user: {
-        memberships: {
-          some: { groupId: input.groupId },
-        },
-      },
-    },
-    include: { user: true },
-  });
-
-  for (const identity of identities) {
-    const profile = await fetchSlackUserProfile({
-      token: input.token,
-      userId: identity.providerUserId,
-      fallbackDisplayName: identity.user.displayName,
-      fallbackUsername: identity.providerUsername ?? undefined,
-    });
-
-    if (
-      profile.displayName !== identity.user.displayName ||
-      profile.providerUsername !== (identity.providerUsername ?? undefined)
-    ) {
-      await prisma.$transaction([
-        prisma.user.update({
-          where: { id: identity.userId },
-          data: { displayName: profile.displayName },
-        }),
-        prisma.userIdentity.update({
-          where: { id: identity.id },
-          data: { providerUsername: profile.providerUsername },
-        }),
-      ]);
-    }
-  }
 }

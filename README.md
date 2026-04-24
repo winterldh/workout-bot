@@ -116,8 +116,10 @@ npm run prisma:seed
 
 ## Slack 동작
 
-- `#목표확인`: Slack 사용자를 UserIdentity/GroupMembership에 등록합니다.
-- `#인증` + 이미지: RawSubmission, SubmissionAsset, CheckInRecord를 저장합니다.
+- `#등록 이름`: Slack userId 기준으로 내부 사용자 등록 또는 displayName 변경을 처리합니다.
+- `#목표확인`: 등록 트리거가 아니며 현재 목표/패널티 안내만 반환합니다.
+- 미등록 유저의 `#인증` + 이미지: 저장하지 않고 `#등록 이름` 안내만 반환합니다.
+- 등록 유저의 `#인증` + 이미지: RawSubmission, SubmissionAsset, CheckInRecord를 저장합니다.
 - Slack 이미지는 `SLACK_BOT_TOKEN`으로 다운로드한 뒤 Vercel Blob에 업로드하고, DB에는 `blobUrl`에 저장합니다.
 - Slack 원본 파일 URL은 `slackOriginalUrl`에 보관합니다. 기존 `originalUrl`, `originalPhotoUrl`, `imageUrl`은 호환용 legacy 필드입니다.
 - 동일 `goalId + userId + recordDate` 중복: SlackChangeCandidate를 upsert합니다.
@@ -140,9 +142,12 @@ npm run prisma:seed
 
 ### 검증 시나리오
 
-- `#인증` + 이미지 1장: `RawSubmission` / `SubmissionAsset` / `CheckInRecord` 생성
-- `#인증` + 이미지 여러 장: 첫 번째 지원 이미지로 생성
-- `#인증` 텍스트만: 저장 없이 안내 메시지
+- 미등록 `#등록 이름`: 등록 생성 또는 displayName 변경 후 1회 안내
+- 미등록 `#목표확인`: 목표/패널티 + `#등록 이름` 안내
+- 미등록 `#인증` + 이미지: 저장 없이 `#등록 이름` 안내
+- 등록 `#인증` + 이미지 1장: `RawSubmission` / `SubmissionAsset` / `CheckInRecord` 생성
+- 등록 `#인증` + 이미지 여러 장: 첫 번째 지원 이미지로 생성
+- 등록 `#인증` 텍스트만: 저장 없이 안내 메시지
 - 중복 인증: `SlackChangeCandidate` upsert
 - Blob 업로드 실패: Slack URL fallback 저장 및 `slack.asset_upload_fallback` 로그 확인
 
@@ -150,6 +155,7 @@ npm run prisma:seed
 
 - Slack event URL이 `/api/slack/events`로 연결됐는지 확인합니다.
 - `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`, `BLOB_READ_WRITE_TOKEN` 누락 여부를 먼저 확인합니다.
+- Slack 사용자 이름은 `users.info`로 자동 조회하지 않고, `#등록 이름` 입력으로만 관리합니다.
 - 이상 시 `requestId` / `eventId` 기준으로 `slack.*` JSON 로그를 따라가면 됩니다.
 - Blob 업로드 실패가 반복되면 Slack 토큰 권한과 Vercel Blob 토큰을 우선 점검합니다.
 - weekly report는 `WeeklyReportRun` 테이블의 `runKey`로 중복 실행을 막고, 30분 이상 오래된 RUNNING 상태만 재시도합니다.

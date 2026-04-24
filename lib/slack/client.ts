@@ -1,67 +1,6 @@
-export interface SlackUserProfile {
-  displayName: string;
-  providerUsername?: string;
-}
-
 interface SlackApiResult {
   ok?: boolean;
   error?: string;
-}
-
-export async function fetchSlackUserProfile(input: {
-  token?: string;
-  userId: string;
-  fallbackDisplayName: string;
-  fallbackUsername?: string;
-}): Promise<SlackUserProfile> {
-  if (!input.token) {
-    return {
-      displayName: input.fallbackDisplayName,
-      providerUsername: input.fallbackUsername,
-    };
-  }
-
-  try {
-    const response = await fetch('https://slack.com/api/users.info', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Bearer ${input.token}`,
-      },
-      body: new URLSearchParams({ user: input.userId }),
-    });
-    const result = (await response.json()) as SlackApiResult & {
-      user?: {
-        name?: string;
-        profile?: {
-          display_name?: string;
-          real_name?: string;
-        };
-      };
-    };
-
-    if (!response.ok || !result.ok) {
-      console.warn('Slack users.info failed', result.error ?? response.statusText);
-      return {
-        displayName: input.fallbackDisplayName,
-        providerUsername: input.fallbackUsername,
-      };
-    }
-
-    return {
-      displayName:
-        result.user?.profile?.display_name?.trim() ||
-        result.user?.profile?.real_name?.trim() ||
-        input.fallbackDisplayName,
-      providerUsername: result.user?.name?.trim() ?? input.fallbackUsername,
-    };
-  } catch (error) {
-    console.warn('Slack users.info request failed', error);
-    return {
-      displayName: input.fallbackDisplayName,
-      providerUsername: input.fallbackUsername,
-    };
-  }
 }
 
 export async function sendSlackMessage(input: {
