@@ -17,6 +17,25 @@ interface SlackEventFile {
   size?: number;
   url_private?: string;
   url_private_download?: string;
+  initial_comment?: {
+    comment?: string;
+  };
+}
+
+interface SlackTextBlock {
+  type?: string;
+  text?: {
+    type?: string;
+    text?: string;
+  };
+  elements?: Array<
+    | {
+        type?: string;
+        text?: string;
+        elements?: SlackTextBlock[];
+      }
+    | string
+  >;
 }
 
 interface SlackMessageEvent {
@@ -31,6 +50,11 @@ interface SlackMessageEvent {
   client_msg_id?: string;
   username?: string;
   files?: SlackEventFile[];
+  blocks?: SlackTextBlock[];
+  message?: {
+    text?: string;
+    blocks?: SlackTextBlock[];
+  };
 }
 
 type SlackIntent = 'checkin' | 'change' | 'admin_checkin' | 'goal_confirm';
@@ -75,11 +99,11 @@ export async function handleSlackEvent(
     return { ok: true, ignored: true };
   }
 
-  const intent = getIntentFromText(event.text);
+  const intent = getIntentFromPayload(payload, event);
   const imageSelection = selectSupportedSlackImageFile(event.files);
   const selectedFile = imageSelection.selectedFile;
   const slackFileUrl = selectedFile?.url_private_download ?? selectedFile?.url_private;
-  const mentionedUserId = extractMentionedUserId(event.text);
+  const mentionedUserId = extractMentionedUserId(extractPrimaryText(payload, event));
   const isMessage =
     event.type === 'message' && (!event.subtype || event.subtype === 'file_share');
 
@@ -632,23 +656,101 @@ function buildGoalConfirmMessage(input: {
   return lines.join('\n');
 }
 
-function getIntentFromText(text?: string): SlackIntent | null {
-  if (!text) {
-    return null;
-  }
-  if (text.includes('#대신인증')) {
+function getIntentFromPayload(payload: Record<string, any>, event: SlackMessageEvent): SlackIntent | null {
+  const texts = extractIntentTexts(payload, event);
+
+  if (texts.some((text) => text.includes('#대신인증'))) {
     return 'admin_checkin';
   }
-  if (text.includes('#변경')) {
+  if (texts.some((text) => text.includes('#변경'))) {
     return 'change';
   }
-  if (text.includes('#목표확인')) {
+  if (texts.some((text) => text.includes('#목표확인'))) {
     return 'goal_confirm';
   }
-  if (text.includes('#인증')) {
+  if (texts.some((text) => containsCheckinIntent(text))) {
     return 'checkin';
   }
   return null;
+}
+
+function extractPrimaryText(payload: Record<string, any>, event: SlackMessageEvent) {
+  return extractIntentTexts(payload, event)[0];
+}
+
+function extractIntentTexts(payload: Record<string, any>, event: SlackMessageEvent) {
+  const texts = new Set<string>();
+  const candidates = [
+    event.text,
+    event.message?.text,
+    payload.message?.text,
+    ...extractFileComments(event.files),
+    ...extractBlockTexts(event.blocks),
+    ...extractBlockTexts(event.message?.blocks),
+    ...extractBlockTexts(payload.message?.blocks),
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const normalized = candidate.trim();
+      if (normalized) {
+        texts.add(normalized);
+      }
+    }
+  }
+
+  return [...texts];
+}
+
+function extractFileComments(files?: SlackEventFile[]) {
+  return (
+    files?.flatMap((file) => (file.initial_comment?.comment ? [file.initial_comment.comment] : [])) ?? []
+  );
+}
+
+function extractBlockTexts(blocks?: SlackTextBlock[]) {
+  const collected: string[] = [];
+
+  const walk = (value: unknown) => {
+    if (!value) {
+      return;
+    }
+    if (typeof value === 'string') {
+      collected.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        walk(item);
+      }
+      return;
+    }
+    if (typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (typeof record.text === 'string') {
+        collected.push(record.text);
+      }
+      if (record.text && typeof record.text === 'object' && typeof (record.text as Record<string, unknown>).text === 'string') {
+        collected.push((record.text as Record<string, unknown>).text as string);
+      }
+      walk(record.elements);
+    }
+  };
+
+  walk(blocks);
+  return collected;
+}
+
+function containsCheckinIntent(text?: string) {
+  if (!text) {
+    return false;
+  }
+
+  if (text.includes('#인증')) {
+    return true;
+  }
+
+  return /(^|[\s(])인증($|[\s).,!?:;\]])/.test(text);
 }
 
 function extractMentionedUserId(text?: string) {
