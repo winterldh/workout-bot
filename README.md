@@ -190,6 +190,7 @@ npm run prisma:seed
 4. `#인증` + 이미지 여러 장으로 첫 번째 지원 이미지만 저장되는지 확인합니다.
 5. `#인증` 텍스트만 입력했을 때 저장 없이 안내 메시지만 오는지 확인합니다.
 6. 중복 인증 시 `SlackChangeCandidate` upsert와 duplicate 응답이 유지되는지 확인합니다.
+7. `prisma/schema.prisma` 또는 `prisma/migrations`를 수정했다면, 운영 DB에 `npx prisma migrate deploy`가 성공하기 전에는 작업을 완료로 보고하지 않습니다.
 
 ## TODO / 리스크
 
