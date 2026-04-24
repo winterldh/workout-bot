@@ -44,15 +44,8 @@ export async function POST(request: NextRequest) {
       eventId: payload.event_id ?? undefined,
     };
 
-    void handleSlackEvent(payload, eventContext).catch((error) => {
-      logEvent('error', 'slack.event_processing_failed', {
-        eventType: 'slack_event',
-        ...eventContext,
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    });
-
-    return NextResponse.json({ ok: true, received: true });
+    const result = await handleSlackEvent(payload, eventContext);
+    return NextResponse.json(result ?? { ok: true, received: true });
   } catch (error) {
     if (error instanceof SlackRequestError) {
       logEvent('warn', 'slack.signature_verification_failed', {
