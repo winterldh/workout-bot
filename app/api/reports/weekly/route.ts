@@ -17,10 +17,10 @@ export async function GET(request: NextRequest) {
           where: {
             workspaceId_channelId: { workspaceId, channelId },
           },
-          include: { group: true, goal: true },
+          include: { group: true },
         })
       : await prisma.slackIntegration.findFirst({
-          include: { group: true, goal: true },
+          include: { group: true },
           orderBy: { createdAt: 'asc' },
         });
 
@@ -31,7 +31,6 @@ export async function GET(request: NextRequest) {
   const text = await buildWeeklyReportText({
     groupId: integration.groupId,
     goalId: integration.goalId,
-    targetCount: integration.goal.targetCount,
     timeZone: integration.group.timezone,
     now: new Date(),
   });

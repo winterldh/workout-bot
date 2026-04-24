@@ -17,6 +17,12 @@ import {
   renameSlackUserFromCommand,
   ensureSlackUserMembership,
 } from '@/lib/services/users';
+import {
+  getGroupRuntimeSettings,
+  formatWeeklyPenaltyDisplayText,
+  updateActiveGoalTargetCount,
+  upsertGroupWeeklyPenaltyText,
+} from '@/lib/services/group-settings';
 import { formatSlackMention, sendSlackDirectMessage, sendSlackMessage } from '@/lib/slack/client';
 import { storeSlackPhotoToBlob } from '@/lib/slack/file-storage';
 import { toSlackTimestampDate } from '@/lib/domain/date';
@@ -68,23 +74,36 @@ interface SlackMessageEvent {
   };
 }
 
-type SlackIntent = 'register' | 'checkin' | 'change' | 'admin_checkin' | 'goal_confirm' | 'status' | 'help';
+type SlackIntent =
+  | 'register'
+  | 'checkin'
+  | 'change'
+  | 'admin_checkin'
+  | 'goal_confirm'
+  | 'status'
+  | 'help'
+  | 'settings_confirm'
+  | 'settings_goal'
+  | 'settings_penalty';
 
 export function analyzeSlackIntent(
   payload: Record<string, any>,
   event: SlackMessageEvent,
   botUserId?: string,
+  options?: { allowNoMention?: boolean },
 ) {
   const texts = extractIntentTexts(payload, event);
   const commandText = findMentionedCommandText(texts, botUserId);
-  const normalizedCommandText = commandText ? stripBotMention(commandText, botUserId) : '';
-  const intent = commandText ? getIntentFromCommandText(normalizedCommandText) : null;
+  const fallbackCommandText = options?.allowNoMention ? texts[0] ?? null : null;
+  const selectedCommandText = commandText ?? fallbackCommandText;
+  const normalizedCommandText = selectedCommandText ? stripBotMention(selectedCommandText, botUserId) : '';
+  const intent = selectedCommandText ? getIntentFromCommandText(normalizedCommandText) : null;
 
   return {
     intent,
     texts,
     commandText: normalizedCommandText,
-    reason: intent ? null : commandText ? 'unrecognized_command' : 'no_bot_mention',
+    reason: intent ? null : selectedCommandText ? 'unrecognized_command' : 'no_bot_mention',
   };
 }
 
@@ -207,9 +226,10 @@ export async function handleSlackEvent(
   const ignoredActorReason = getIgnoredActorEventReason(event);
   const isChannelContext =
     typeof channelId === 'string' && (channelId.startsWith('C') || channelId.startsWith('G'));
+  const isDirectMessageContext = typeof channelId === 'string' && channelId.startsWith('D');
   const isThreadReply = Boolean(event.thread_ts && event.thread_ts !== event.ts);
 
-  if (!workspaceId || !channelId || !userId || ignoredActorReason || !isChannelContext) {
+  if (!workspaceId || !channelId || !userId || ignoredActorReason || (!isChannelContext && !isDirectMessageContext)) {
     logEvent('info', 'slack.ignored_event', {
       eventType: 'slack_checkin',
       ...context,
@@ -256,10 +276,14 @@ export async function handleSlackEvent(
     return { ok: true, ignored: true };
   }
 
-  const intentAnalysis = analyzeSlackIntent(payload, event, botUserId);
+  const intentAnalysis = analyzeSlackIntent(payload, event, botUserId, {
+    allowNoMention: isDirectMessageContext,
+  });
   const intent = intentAnalysis.intent;
   const commandText = intentAnalysis.commandText;
-  const hasMention = Boolean(commandText || intentAnalysis.reason !== 'no_bot_mention');
+  const hasMention = isDirectMessageContext
+    ? true
+    : Boolean(commandText || intentAnalysis.reason !== 'no_bot_mention');
   const imageSelection = selectSupportedSlackImageFile(event.files);
   const selectedFile = imageSelection.selectedFile;
   const slackFileUrl = selectedFile?.url_private_download ?? selectedFile?.url_private;
@@ -331,6 +355,90 @@ export async function handleSlackEvent(
     });
   }
 
+  if (isDirectMessageContext && intent?.startsWith('settings_')) {
+    const settingsResult = await handleAdminSettingsDm({
+      payload,
+      context,
+      workspaceId,
+      channelId,
+      userId,
+      botUserId,
+      intent,
+      commandText,
+      receiptClaim,
+    });
+    return settingsResult;
+  }
+
+  if (!isDirectMessageContext && intent?.startsWith('settings_')) {
+    const replied = await sendSlackMessage({
+      token: process.env.SLACK_BOT_TOKEN ?? undefined,
+      channelId,
+      threadTs: event.ts,
+      text: '설정 변경은 관리자 DM에서만 가능해요.',
+    });
+
+    logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+      eventType: 'slack_checkin',
+      ...context,
+      workspaceId,
+      channelId,
+      slackUserId: userId,
+      intent,
+      replyStatus: replied ? 'sent' : 'failed',
+      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      ignoredReason: 'settings_channel_only',
+    });
+    await finalizeSlackEventReceipt({
+      eventId: payload.event_id ?? undefined,
+      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      intent,
+      ignoredReason: 'settings_channel_only',
+      error: replied ? null : 'reply_failed',
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...context,
+        workspaceId,
+        channelId,
+        slackUserId: userId,
+        intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { ok: true, replied: true };
+  }
+
+  if (isDirectMessageContext) {
+    logEvent('info', 'slack.ignored_event', {
+      eventType: 'slack_checkin',
+      ...context,
+      workspaceId,
+      channelId,
+      slackUserId: userId,
+      intent: intent ?? null,
+      ignoredReason: 'dm_non_settings',
+      reason: 'dm_non_settings',
+    });
+    await finalizeSlackEventReceipt({
+      eventId: payload.event_id ?? undefined,
+      status: SlackEventReceiptStatus.SKIPPED,
+      intent: intent ?? null,
+      ignoredReason: 'dm_non_settings',
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...context,
+        workspaceId,
+        channelId,
+        slackUserId: userId,
+        intent: intent ?? null,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { ok: true, ignored: true };
+  }
+
   const integration = await findSlackIntegration(workspaceId, channelId);
     if (!integration) {
       logEvent('info', 'slack.ignored_event', {
@@ -371,10 +479,14 @@ export async function handleSlackEvent(
     });
 
     const token = process.env.SLACK_BOT_TOKEN ?? integration.botToken ?? undefined;
+    const runtimeSettings = await getGroupRuntimeSettings({
+      groupId: integration.groupId,
+      goalId: integration.goalId,
+    });
     const goalInfo = {
-      goalTitle: integration.goal.title,
-      targetCount: integration.goal.targetCount,
-      penaltyText: process.env.WEEKLY_PENALTY_TEXT?.trim() || undefined,
+      goalTitle: runtimeSettings.activeGoal?.title ?? integration.goal.title,
+      targetCount: runtimeSettings.activeGoal?.targetCount ?? integration.goal.targetCount,
+      penaltyText: runtimeSettings.weeklyPenaltyText ?? undefined,
     };
     const mention = formatSlackMention(botUserId);
     const isFirstInteraction = !registrationState.isRegistered;
@@ -1367,13 +1479,17 @@ async function registerSlackUserFromGoalConfirm(input: {
       groupId: integration.groupId,
     }),
   );
+  const runtimeSettings = await getGroupRuntimeSettings({
+    groupId: integration.groupId,
+    goalId: integration.goalId,
+  });
 
   return {
     userCreated: ensured.userCreated,
     membershipCreated: ensured.membershipCreated,
     goalTitle: integration.goal.title,
     targetCount: integration.goal.targetCount,
-    penaltyText: process.env.WEEKLY_PENALTY_TEXT?.trim() || undefined,
+    penaltyText: runtimeSettings.weeklyPenaltyText ?? undefined,
   };
 }
 
@@ -1426,6 +1542,371 @@ async function validateAdminProxyRequest(input: {
   return { ok: true as const };
 }
 
+async function handleAdminSettingsDm(input: {
+  payload: Record<string, any>;
+  context: LogContext;
+  workspaceId: string;
+  channelId: string;
+  userId: string;
+  botUserId: string;
+  intent: SlackIntent;
+  commandText: string;
+  receiptClaim: Awaited<ReturnType<typeof claimSlackEventReceipt>>;
+}) {
+  const resolved = await resolveAdminSettingsIntegration({
+    workspaceId: input.workspaceId,
+    userId: input.userId,
+  });
+
+  if (!resolved.ok) {
+    const replied = await sendSlackMessage({
+      token: process.env.SLACK_BOT_TOKEN ?? undefined,
+      channelId: input.channelId,
+      text: '설정을 변경할 권한이 없어요.',
+    });
+
+    logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+      eventType: 'slack_checkin',
+      ...input.context,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      slackUserId: input.userId,
+      intent: input.intent,
+      replyStatus: replied ? 'sent' : 'failed',
+      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      ignoredReason: resolved.reason,
+    });
+    await finalizeSlackEventReceipt({
+      eventId: input.payload.event_id ?? undefined,
+      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      intent: input.intent,
+      ignoredReason: resolved.reason,
+      error: replied ? null : 'reply_failed',
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.userId,
+        intent: input.intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { ok: true, replied: true };
+  }
+
+  const mention = formatSlackMention(input.botUserId);
+  const settings = await getGroupRuntimeSettings({
+    groupId: resolved.integration.groupId,
+    goalId: resolved.integration.goalId,
+  });
+  const currentTargetCount = settings.activeGoal?.targetCount ?? resolved.integration.goal.targetCount;
+  const currentPenaltyText = settings.weeklyPenaltyText;
+
+  if (input.intent === 'settings_confirm') {
+    const replied = await sendSlackMessage({
+      token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+      channelId: input.channelId,
+      text: buildAdminSettingsSummaryText({
+        targetCount: currentTargetCount,
+        weeklyPenaltyText: currentPenaltyText,
+      }),
+    });
+
+    logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+      eventType: 'slack_checkin',
+      ...input.context,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      groupId: resolved.integration.groupId,
+      goalId: resolved.integration.goalId,
+      slackUserId: input.userId,
+      intent: input.intent,
+      replyStatus: replied ? 'sent' : 'failed',
+      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+    });
+    await finalizeSlackEventReceipt({
+      eventId: input.payload.event_id ?? undefined,
+      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      intent: input.intent,
+      error: replied ? null : 'reply_failed',
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.userId,
+        intent: input.intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { ok: true, replied: true };
+  }
+
+  if (input.intent === 'settings_goal') {
+    const nextTargetCount = parseTargetCountFromCommandText(input.commandText);
+    if (nextTargetCount === null) {
+      const replied = await sendSlackMessage({
+        token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+        channelId: input.channelId,
+        text: '목표 횟수를 숫자로 입력해주세요.\n예: 목표 설정 주 5회',
+      });
+      await finalizeSlackEventReceipt({
+        eventId: input.payload.event_id ?? undefined,
+        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        intent: input.intent,
+        error: replied ? null : 'reply_failed',
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...input.context,
+          workspaceId: input.workspaceId,
+          channelId: input.channelId,
+          slackUserId: input.userId,
+          intent: input.intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return { ok: true, replied: true };
+    }
+
+    const previousTargetCount = currentTargetCount;
+    const updatedGoal = await updateActiveGoalTargetCount({
+      groupId: resolved.integration.groupId,
+      targetCount: nextTargetCount,
+    });
+
+    if (!updatedGoal) {
+      const replied = await sendSlackMessage({
+        token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+        channelId: input.channelId,
+        text: '현재 활성 목표를 찾을 수 없어요.',
+      });
+      await finalizeSlackEventReceipt({
+        eventId: input.payload.event_id ?? undefined,
+        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        intent: input.intent,
+        error: replied ? null : 'reply_failed',
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...input.context,
+          workspaceId: input.workspaceId,
+          channelId: input.channelId,
+          slackUserId: input.userId,
+          intent: input.intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return { ok: true, replied: true };
+    }
+
+    const replied = await sendSlackMessage({
+      token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+      channelId: input.channelId,
+      text: buildAdminSettingsGoalUpdatedText({
+        previousTargetCount,
+        nextTargetCount,
+        mention,
+      }),
+    });
+
+    logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+      eventType: 'slack_checkin',
+      ...input.context,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      groupId: resolved.integration.groupId,
+      goalId: resolved.integration.goalId,
+      slackUserId: input.userId,
+      intent: input.intent,
+      replyStatus: replied ? 'sent' : 'failed',
+      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+    });
+    await finalizeSlackEventReceipt({
+      eventId: input.payload.event_id ?? undefined,
+      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      intent: input.intent,
+      error: replied ? null : 'reply_failed',
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.userId,
+        intent: input.intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { ok: true, replied: true, updatedGoal: true };
+  }
+
+  if (input.intent === 'settings_penalty') {
+    const nextPenaltyText = parsePenaltyTextFromCommandText(input.commandText);
+    if (!nextPenaltyText) {
+      const replied = await sendSlackMessage({
+        token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+        channelId: input.channelId,
+        text: '패널티 금액을 숫자로 입력해주세요.\n예: 패널티 설정 10000원',
+      });
+      await finalizeSlackEventReceipt({
+        eventId: input.payload.event_id ?? undefined,
+        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        intent: input.intent,
+        error: replied ? null : 'reply_failed',
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...input.context,
+          workspaceId: input.workspaceId,
+          channelId: input.channelId,
+          slackUserId: input.userId,
+          intent: input.intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return { ok: true, replied: true };
+    }
+
+    const previousPenaltyText = currentPenaltyText;
+    await upsertGroupWeeklyPenaltyText({
+      groupId: resolved.integration.groupId,
+      weeklyPenaltyText: nextPenaltyText,
+    });
+
+    const replied = await sendSlackMessage({
+      token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+      channelId: input.channelId,
+      text: buildAdminSettingsPenaltyUpdatedText({
+        previousPenaltyText,
+        nextPenaltyText,
+        mention,
+      }),
+    });
+
+    logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+      eventType: 'slack_checkin',
+      ...input.context,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      groupId: resolved.integration.groupId,
+      goalId: resolved.integration.goalId,
+      slackUserId: input.userId,
+      intent: input.intent,
+      replyStatus: replied ? 'sent' : 'failed',
+      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+    });
+    await finalizeSlackEventReceipt({
+      eventId: input.payload.event_id ?? undefined,
+      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      intent: input.intent,
+      error: replied ? null : 'reply_failed',
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.userId,
+        intent: input.intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { ok: true, replied: true, updatedPenalty: true };
+  }
+
+  const replied = await sendSlackMessage({
+    token: process.env.SLACK_BOT_TOKEN ?? resolved.integration.botToken ?? undefined,
+    channelId: input.channelId,
+    text: '설정을 변경할 권한이 없어요.',
+  });
+  await finalizeSlackEventReceipt({
+    eventId: input.payload.event_id ?? undefined,
+    status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+    intent: input.intent,
+    error: replied ? null : 'reply_failed',
+  }).catch((error) => {
+    logEvent('warn', 'slack.event_receipt_finalize_failed', {
+      eventType: 'slack_checkin',
+      ...input.context,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      slackUserId: input.userId,
+      intent: input.intent,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  });
+  return { ok: true, replied: true };
+}
+
+async function resolveAdminSettingsIntegration(input: {
+  workspaceId: string;
+  userId: string;
+}) {
+  const identity = await prisma.userIdentity.findUnique({
+    where: {
+      provider_providerUserId_providerWorkspaceId: {
+        provider: 'SLACK',
+        providerUserId: input.userId,
+        providerWorkspaceId: input.workspaceId,
+      },
+    },
+    select: {
+      userId: true,
+      user: {
+        select: {
+          memberships: {
+            select: {
+              groupId: true,
+              role: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!identity) {
+    return { ok: false as const, reason: 'missing_registration' };
+  }
+
+  const adminGroupIds = identity.user.memberships
+    .filter((membership) => membership.role === 'ADMIN')
+    .map((membership) => membership.groupId);
+
+  if (adminGroupIds.length === 0) {
+    return { ok: false as const, reason: 'permission_denied' };
+  }
+
+  const integrations = await prisma.slackIntegration.findMany({
+    where: {
+      workspaceId: input.workspaceId,
+      groupId: { in: adminGroupIds },
+    },
+    include: {
+      group: true,
+      goal: true,
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  if (integrations.length === 0) {
+    return { ok: false as const, reason: 'permission_denied' };
+  }
+
+  if (integrations.length > 1) {
+    return { ok: false as const, reason: 'permission_denied' };
+  }
+
+  return {
+    ok: true as const,
+    integration: integrations[0],
+  };
+}
+
 function getIntentFromCommandText(text: string): SlackIntent | null {
   const normalized = text.trim();
   if (!normalized) {
@@ -1438,6 +1919,18 @@ function getIntentFromCommandText(text: string): SlackIntent | null {
 
   if (/^(현황)(?:\s+.*)?$/.test(normalized)) {
     return 'status';
+  }
+
+  if (/^(설정\s*확인)(?:\s+.*)?$/.test(normalized)) {
+    return 'settings_confirm';
+  }
+
+  if (/^(목표\s*설정)(?:\s+.*)?$/.test(normalized)) {
+    return 'settings_goal';
+  }
+
+  if (/^(패널티\s*설정)(?:\s+.*)?$/.test(normalized)) {
+    return 'settings_penalty';
   }
 
   if (/^(목표확인)(?:\s+.*)?$/.test(normalized)) {
@@ -1504,8 +1997,9 @@ function buildGoalInfoText(input: {
   penaltyText?: string;
 }) {
   const lines = [`현재 목표: ${input.goalTitle}`];
-  if (input.penaltyText) {
-    lines.push(`미달성 시 패널티: ${input.penaltyText}`);
+  const penaltyText = formatWeeklyPenaltyDisplayText(input.penaltyText);
+  if (penaltyText) {
+    lines.push(`미달성 시 패널티: ${penaltyText}`);
   }
   return lines.join('\n');
 }
@@ -1589,6 +2083,74 @@ function buildRegistrationSuccessText(input: {
 
 function buildRegistrationRenameText(input: { displayName: string }) {
   return `이름이 ${input.displayName}님으로 변경되었습니다.`;
+}
+
+function buildAdminSettingsSummaryText(input: {
+  targetCount: number;
+  weeklyPenaltyText?: string | null;
+}) {
+  return [
+    '현재 설정이에요 ⚙️',
+    '',
+    `목표: 주 ${input.targetCount}회 인증`,
+    `패널티: ${formatWeeklyPenaltyDisplayText(input.weeklyPenaltyText) ?? '없음'}`,
+  ].join('\n');
+}
+
+function buildAdminSettingsGoalUpdatedText(input: {
+  previousTargetCount: number;
+  nextTargetCount: number;
+  mention: string;
+}) {
+  return [
+    '목표가 변경됐어요.',
+    '',
+    `이전: 주 ${input.previousTargetCount}회`,
+    `변경: 주 ${input.nextTargetCount}회`,
+    '',
+    '이 변경은 현재 주간 현황과 리포트에 바로 반영됩니다.',
+    `채널에서 ${input.mention} 목표확인으로 반영 여부를 확인할 수 있어요.`,
+  ].join('\n');
+}
+
+function buildAdminSettingsPenaltyUpdatedText(input: {
+  previousPenaltyText: string | null;
+  nextPenaltyText: string | null;
+  mention: string;
+}) {
+  return [
+    '패널티가 변경됐어요.',
+    '',
+    `이전: ${formatWeeklyPenaltyDisplayText(input.previousPenaltyText) ?? '없음'}`,
+    `변경: ${formatWeeklyPenaltyDisplayText(input.nextPenaltyText) ?? '없음'}`,
+  ].join('\n');
+}
+
+function parseTargetCountFromCommandText(text: string) {
+  const normalized = stripBotMention(text, process.env.SLACK_BOT_USER_ID?.trim());
+  const match = normalized.match(/^(?:목표\s*설정\s*주?|목표\s*설정|설정\s*목표)\s*(\d+)\s*회$/);
+  if (!match) {
+    return null;
+  }
+
+  const value = Number.parseInt(match[1] ?? '', 10);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function parsePenaltyTextFromCommandText(text: string) {
+  const normalized = stripBotMention(text, process.env.SLACK_BOT_USER_ID?.trim());
+  const match = normalized.match(/^(?:패널티\s*설정|설정\s*패널티)\s*([\d,]+)\s*원$/);
+  if (!match) {
+    return null;
+  }
+
+  const rawValue = match[1]?.replace(/,/g, '') ?? '';
+  const value = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(value) || value < 0) {
+    return null;
+  }
+
+  return formatWeeklyPenaltyDisplayText(`${value.toLocaleString('ko-KR')}원`);
 }
 
 function buildCheckInSuccessText(input: {

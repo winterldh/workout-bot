@@ -2,6 +2,7 @@ import { CheckInRecordStatus, IdentityProvider } from '@prisma/client';
 import { getWeekRange } from '@/lib/domain/date';
 import { prisma } from '@/lib/prisma';
 import { formatSlackMention } from '@/lib/slack/client';
+import { getGroupRuntimeSettings, formatWeeklyPenaltyDisplayText } from '@/lib/services/group-settings';
 
 export async function getCurrentStatus(input: {
   workspaceId: string;
@@ -24,6 +25,15 @@ export async function getCurrentStatus(input: {
   }
 
   const range = getWeekRange(input.now ?? new Date(), integration.group.timezone);
+  const runtimeSettings = await getGroupRuntimeSettings({
+    groupId: integration.groupId,
+    goalId: integration.goalId,
+  });
+  const activeGoal = runtimeSettings.activeGoal ?? {
+    id: integration.goalId,
+    title: integration.goal.title,
+    targetCount: integration.goal.targetCount,
+  };
 
   const checkIns = await prisma.checkInRecord.findMany({
     where: {
@@ -78,7 +88,7 @@ export async function getCurrentStatus(input: {
         userId: membership.userId,
         displayName: membership.user.displayName,
         count,
-        targetCount: integration.goal.targetCount,
+        targetCount: activeGoal.targetCount,
       };
     })
     .sort(
@@ -91,8 +101,8 @@ export async function getCurrentStatus(input: {
 
   return {
     groupName: integration.group.name,
-    goalTitle: integration.goal.title,
-    targetCount: integration.goal.targetCount,
+    goalTitle: activeGoal.title,
+    targetCount: activeGoal.targetCount,
     totalCheckIns: checkIns.length,
     participantCount: ranking.filter((entry) => entry.count > 0).length,
     ranking,
@@ -121,7 +131,8 @@ export function buildGoalInfoText(input: {
   penaltyText?: string;
 }) {
   const lines = [`현재 목표: ${input.goalTitle}`];
-  lines.push(`미달성 시 패널티: ${input.penaltyText ?? '없음'}`);
+  const penaltyText = formatWeeklyPenaltyDisplayText(input.penaltyText);
+  lines.push(`미달성 시 패널티: ${penaltyText ?? '없음'}`);
   return lines.join('\n');
 }
 

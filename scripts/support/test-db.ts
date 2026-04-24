@@ -25,6 +25,7 @@ export async function resetTestDatabase(prisma: PrismaClient) {
   await prisma.checkInRecord.deleteMany();
   await prisma.submissionAsset.deleteMany();
   await prisma.rawSubmission.deleteMany();
+  await prisma.groupSetting.deleteMany();
   await prisma.userIdentity.deleteMany();
   await prisma.groupMembership.deleteMany();
   await prisma.goal.deleteMany();
@@ -239,6 +240,11 @@ export async function resetScenarioFixtureData(
   ).map((goal) => goal.id);
 
   await prisma.slackChangeCandidate.deleteMany({
+    where: {
+      groupId: group.id,
+    },
+  });
+  await prisma.groupSetting.deleteMany({
     where: {
       groupId: group.id,
     },

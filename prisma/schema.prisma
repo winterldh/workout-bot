@@ -84,11 +84,21 @@ model Group {
   updatedAt      DateTime          @updatedAt
   creator        User              @relation("GroupCreator", fields: [creatorUserId], references: [id])
   memberships    GroupMembership[]
+  setting        GroupSetting?
   goals          Goal[]
   slackIntegrations SlackIntegration[]
   submissions    RawSubmission[]
   checkInRecords CheckInRecord[]
   slackChangeCandidates SlackChangeCandidate[]
+}
+
+model GroupSetting {
+  id                String   @id @default(cuid())
+  groupId           String   @unique
+  weeklyPenaltyText  String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  group             Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
 }
 
 model UserIdentity {

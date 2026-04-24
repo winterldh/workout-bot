@@ -49,6 +49,7 @@ SLACK_SIGNATURE_VERIFICATION_DISABLED
 ```
 
 `DATABASE_URL`은 앱 런타임용 Supabase Transaction pooler URI, `DIRECT_URL`은 Prisma migration용 Supabase Direct connection URI입니다. `BLOB_READ_WRITE_TOKEN`은 Slack private file을 Vercel Blob에 저장할 때 필요하고, `CRON_SECRET`은 주간 리포트 Cron 보호용입니다.
+`WEEKLY_PENALTY_TEXT`는 `GroupSetting.weeklyPenaltyText`가 없을 때만 사용하는 fallback입니다.
 
 ## 로컬 실행
 
@@ -124,6 +125,10 @@ npm run prisma:seed
 - `<@BOT_USER_ID> 목표확인`: 현재 목표/패널티와 내 진행도를 스레드로 반환합니다.
 - `<@BOT_USER_ID> 현황`: 이번 주 전체 현황을 스레드로 반환합니다.
 - `<@BOT_USER_ID>`: 사용 방법 안내를 스레드로 반환합니다.
+- 관리자 DM에서만 설정 변경 명령을 허용합니다.
+  - `목표 설정 주 N회`: 현재 ACTIVE Goal.targetCount를 직접 변경합니다.
+  - `패널티 설정 N원`: `GroupSetting.weeklyPenaltyText`를 저장합니다.
+  - `설정 확인`: 현재 목표와 패널티를 확인합니다.
 - Slack 이미지는 `SLACK_BOT_TOKEN`으로 다운로드한 뒤 Vercel Blob에 업로드하고, DB에는 `blobUrl`에 저장합니다.
 - Slack 원본 파일 URL은 `slackOriginalUrl`에 보관합니다. 기존 `originalUrl`, `originalPhotoUrl`, `imageUrl`은 호환용 legacy 필드입니다.
 - 동일 `goalId + userId + recordDate` 중복: SlackChangeCandidate를 upsert합니다.
@@ -164,6 +169,7 @@ npm run prisma:seed
 - 이상 시 `requestId` / `eventId` 기준으로 `slack.*` JSON 로그를 따라가면 됩니다.
 - Blob 업로드 실패가 반복되면 Slack 토큰 권한과 Vercel Blob 토큰을 우선 점검합니다.
 - weekly report는 `WeeklyReportRun` 테이블의 `runKey`로 중복 실행을 막고, 30분 이상 오래된 RUNNING 상태만 재시도합니다.
+- 설정 관련 변경이 있으면 `npm run prisma:generate`와 `npx prisma migrate deploy`가 먼저 통과해야 배포 완료로 봅니다.
 
 ### Slack 연동 URL
 

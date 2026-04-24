@@ -3,14 +3,21 @@ import { addUtcDays, getWeekRange } from '@/lib/domain/date';
 import { prisma } from '@/lib/prisma';
 import { logEvent } from '@/lib/observability/logger';
 import { sendSlackMessage } from '@/lib/slack/client';
+import {
+  formatWeeklyPenaltyDisplayText,
+  getGroupRuntimeSettings,
+} from '@/lib/services/group-settings';
 
 export async function buildWeeklyReportText(input: {
   groupId: string;
   goalId: string;
-  targetCount: number;
   timeZone: string;
   now: Date;
 }) {
+  const runtimeSettings = await getGroupRuntimeSettings({
+    groupId: input.groupId,
+    goalId: input.goalId,
+  });
   const currentWeek = getWeekRange(input.now, input.timeZone);
   const lastWeekStart = addUtcDays(currentWeek.startDate, -7);
   const lastWeekEnd = addUtcDays(currentWeek.startDate, -1);
@@ -59,8 +66,9 @@ export async function buildWeeklyReportText(input: {
         left.displayName.localeCompare(right.displayName),
     );
 
-  const achievedMembers = memberResults.filter((entry) => entry.count >= input.targetCount);
-  const missedMembers = memberResults.filter((entry) => entry.count < input.targetCount);
+  const targetCount = runtimeSettings.activeGoal?.targetCount ?? 0;
+  const achievedMembers = memberResults.filter((entry) => entry.count >= targetCount);
+  const missedMembers = memberResults.filter((entry) => entry.count < targetCount);
 
   const lines = ['📅 지난주 운동 결과', ''];
 
@@ -69,7 +77,7 @@ export async function buildWeeklyReportText(input: {
     lines.push('- 없음');
   } else {
     achievedMembers.forEach((entry) => {
-      lines.push(`${entry.displayName} (${entry.count}/${input.targetCount})`);
+      lines.push(`${entry.displayName} (${entry.count}/${targetCount})`);
     });
   }
 
@@ -78,7 +86,7 @@ export async function buildWeeklyReportText(input: {
     lines.push('- 없음');
   } else {
     missedMembers.forEach((entry) => {
-      lines.push(`${entry.displayName} (${entry.count}/${input.targetCount})`);
+      lines.push(`${entry.displayName} (${entry.count}/${targetCount})`);
     });
   }
 
@@ -87,7 +95,7 @@ export async function buildWeeklyReportText(input: {
     lines.push('- 없음');
   } else {
     missedMembers.forEach((entry) => {
-      const penaltyText = process.env.WEEKLY_PENALTY_TEXT?.trim() || '패널티 없음';
+      const penaltyText = formatWeeklyPenaltyDisplayText(runtimeSettings.weeklyPenaltyText) ?? '없음';
       lines.push(`- ${entry.displayName} ${penaltyText}`);
     });
   }
@@ -108,7 +116,7 @@ export async function sendWeeklyReports() {
   }
 
   const integrations = await prisma.slackIntegration.findMany({
-    include: { group: true, goal: true },
+    include: { group: true },
   });
   const results: Array<{ channelId: string; sent: boolean; reason?: string }> = [];
 
@@ -123,7 +131,6 @@ export async function sendWeeklyReports() {
       const text = await buildWeeklyReportText({
         groupId: integration.groupId,
         goalId: integration.goalId,
-        targetCount: integration.goal.targetCount,
         timeZone: integration.group.timezone,
         now,
       });
