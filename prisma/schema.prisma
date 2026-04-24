@@ -48,6 +48,13 @@ enum WeeklyReportRunStatus {
   SKIPPED
 }
 
+enum SlackEventReceiptStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+  SKIPPED
+}
+
 enum SubmissionAssetKind {
   IMAGE
   VIDEO
@@ -181,6 +188,27 @@ model SlackIntegration {
 
   @@unique([workspaceId, channelId])
   @@index([groupId, goalId])
+}
+
+model SlackEventReceipt {
+  id            String               @id @default(cuid())
+  eventId       String               @unique
+  requestId     String?
+  workspaceId   String
+  channelId     String
+  slackUserId   String?
+  eventType     String
+  intent        String?
+  status        SlackEventReceiptStatus @default(PROCESSING)
+  retryNum      Int?
+  retryReason   String?
+  ignoredReason String?
+  error         String?
+  processedAt   DateTime?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  @@index([workspaceId, channelId, createdAt])
 }
 
 model RawSubmission {

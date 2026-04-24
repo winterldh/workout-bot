@@ -3,11 +3,17 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 export interface LogContext {
   requestId?: string;
   eventId?: string;
+  retryNum?: string | null;
+  retryReason?: string | null;
   workspaceId?: string;
   channelId?: string;
   groupId?: string;
   goalId?: string;
   slackUserId?: string;
+  intent?: string | null;
+  ignoredReason?: string | null;
+  replyStatus?: string | null;
+  receiptStatus?: string | null;
 }
 
 export function logEvent(

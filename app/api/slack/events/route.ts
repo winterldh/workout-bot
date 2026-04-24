@@ -9,6 +9,8 @@ export const maxDuration = 60;
 
 export async function POST(request: NextRequest) {
   const requestId = request.headers.get('x-request-id') ?? randomUUID();
+  const retryNum = request.headers.get('x-slack-retry-num');
+  const retryReason = request.headers.get('x-slack-retry-reason');
   const rawBody = await request.text();
 
   try {
@@ -42,7 +44,16 @@ export async function POST(request: NextRequest) {
     const eventContext = {
       requestId,
       eventId: payload.event_id ?? undefined,
+      retryNum,
+      retryReason,
     };
+
+    if (retryNum) {
+      logEvent('info', 'slack.retry_received', {
+        eventType: 'slack_event',
+        ...eventContext,
+      });
+    }
 
     const result = await handleSlackEvent(payload, eventContext);
     return NextResponse.json(result ?? { ok: true, received: true });

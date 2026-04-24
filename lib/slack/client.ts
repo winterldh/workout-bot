@@ -69,9 +69,9 @@ export async function sendSlackMessage(input: {
   channelId?: string | null;
   text: string;
   threadTs?: string;
-}) {
+}): Promise<boolean> {
   if (!input.token || !input.channelId) {
-    return;
+    return false;
   }
 
   try {
@@ -90,9 +90,12 @@ export async function sendSlackMessage(input: {
     const result = (await response.json()) as SlackApiResult;
     if (!response.ok || !result.ok) {
       console.warn('Slack chat.postMessage failed', result.error ?? response.statusText);
+      return false;
     }
+    return true;
   } catch (error) {
     console.warn('Slack chat.postMessage request failed', error);
+    return false;
   }
 }
 

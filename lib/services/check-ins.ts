@@ -68,25 +68,6 @@ export async function createFromSlackMessage(input: {
   });
 
   return prisma.$transaction(async (tx) => {
-    const existingIdentity = await tx.userIdentity.findUnique({
-      where: {
-        provider_providerUserId_providerWorkspaceId: {
-          provider: 'SLACK',
-          providerUserId: input.externalSlackId,
-          providerWorkspaceId: input.workspaceId,
-        },
-      },
-    });
-
-    if (!existingIdentity) {
-      return {
-        status: 'registration_required' as const,
-        userCreated: false,
-        membershipCreated: false,
-        candidateSaved: false,
-      };
-    }
-
     const ensured = await ensureSlackUserMembership({
       tx,
       workspaceId: input.workspaceId,
