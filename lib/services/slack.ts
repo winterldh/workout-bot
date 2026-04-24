@@ -17,7 +17,7 @@ import {
   renameSlackUserFromCommand,
   ensureSlackUserMembership,
 } from '@/lib/services/users';
-import { sendSlackDirectMessage, sendSlackMessage } from '@/lib/slack/client';
+import { formatSlackMention, sendSlackDirectMessage, sendSlackMessage } from '@/lib/slack/client';
 import { storeSlackPhotoToBlob } from '@/lib/slack/file-storage';
 import { toSlackTimestampDate } from '@/lib/domain/date';
 
@@ -376,12 +376,16 @@ export async function handleSlackEvent(
       targetCount: integration.goal.targetCount,
       penaltyText: process.env.WEEKLY_PENALTY_TEXT?.trim() || undefined,
     };
+    const mention = formatSlackMention(botUserId);
+    const isFirstInteraction = !registrationState.isRegistered;
+    const onboardingText = buildFirstVisitText(mention);
+    const shortGuideText = buildShortGuideText(mention);
     if (intent === 'help') {
       const replied = await sendSlackMessage({
         token,
         channelId,
         threadTs: event.ts,
-        text: buildHelpText(),
+        text: isFirstInteraction ? onboardingText : buildHelpText(botUserId),
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -407,6 +411,45 @@ export async function handleSlackEvent(
           channelId,
           slackUserId: userId,
           intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return { ok: true, replied: true };
+    }
+
+    if (!intent) {
+      const replied = await sendSlackMessage({
+        token,
+        channelId,
+        threadTs: event.ts,
+        text: isFirstInteraction ? onboardingText : shortGuideText,
+      });
+
+      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+        eventType: 'slack_checkin',
+        ...context,
+        workspaceId,
+        channelId,
+        slackUserId: userId,
+        intent: null,
+        replyStatus: replied ? 'sent' : 'failed',
+        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        ignoredReason: 'unrecognized_command',
+      });
+      await finalizeSlackEventReceipt({
+        eventId: payload.event_id ?? undefined,
+        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        intent: null,
+        ignoredReason: 'unrecognized_command',
+        error: replied ? null : 'reply_failed',
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          slackUserId: userId,
+          intent: null,
           reason: error instanceof Error ? error.message : String(error),
         });
       });
@@ -487,9 +530,10 @@ export async function handleSlackEvent(
             ? buildRegistrationRenameText({ displayName: registrationName })
             : buildRegistrationSuccessText({
                 displayName: registrationName,
+                mention,
                 ...goalInfo,
               })
-          : '이름을 함께 입력해주세요. 예: `@봇 닉네임 설정 홍길동`',
+          : buildRegistrationNamePromptText(mention),
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -529,8 +573,8 @@ export async function handleSlackEvent(
         threadTs: event.ts,
         text:
           intent === 'goal_confirm'
-            ? buildRegistrationPromptText(goalInfo)
-            : '먼저 닉네임을 설정해주세요 🙂\n\n예: `@봇 닉네임 설정 홍길동`',
+            ? buildRegistrationPromptText(goalInfo, mention)
+            : buildRegistrationPromptText(goalInfo, mention),
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -723,8 +767,8 @@ export async function handleSlackEvent(
       threadTs: event.ts,
       text:
         imageSelection.hasUnsupportedFiles || imageSelection.hasMultipleSupportedFiles
-          ? `<@${userId}> 이미지 1장만 올려주세요`
-          : `<@${userId}> 사진을 함께 올려주세요`,
+          ? `${mention} 이미지 1장만 올려주세요`
+          : buildMissingImageText(mention),
     });
     logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
       eventType: 'slack_checkin',
@@ -857,7 +901,7 @@ export async function handleSlackEvent(
         token,
         channelId,
         threadTs: event.ts,
-        text: `<@${targetUserId}>님은 아직 등록되지 않았어요. 먼저 \`@봇 닉네임 설정 이름\`으로 등록해주세요.`,
+        text: `<@${targetUserId}>님은 아직 등록되지 않았어요. 먼저 \`${mention} 닉네임 설정 이름\`으로 등록해주세요.`,
       });
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
         eventType: 'slack_checkin',
@@ -1017,6 +1061,8 @@ export async function handleSlackEvent(
       actorUserId: userId,
       targetUserId: targetUserId ?? userId,
       displayName: targetDisplayName,
+      mention,
+      goalInfo,
       result,
       isAdminCheckIn: intent === 'admin_checkin',
       currentStatus: currentStatusForAccepted ?? undefined,
@@ -1166,6 +1212,12 @@ async function replyForCheckInResult(input: {
   actorUserId: string;
   targetUserId: string;
   displayName: string;
+  mention: string;
+  goalInfo: {
+    goalTitle: string;
+    targetCount: number;
+    penaltyText?: string;
+  };
   result: Awaited<ReturnType<typeof createFromSlackMessage>>;
   isAdminCheckIn: boolean;
   currentStatus?: Awaited<ReturnType<typeof getCurrentStatus>>;
@@ -1175,7 +1227,7 @@ async function replyForCheckInResult(input: {
       token: input.token,
       channelId: input.channelId,
       threadTs: input.threadTs,
-      text: '먼저 닉네임을 설정해주세요 🙂\n\n예: `@봇 닉네임 설정 홍길동`',
+      text: buildRegistrationPromptText(input.goalInfo, input.mention),
     });
   }
 
@@ -1194,7 +1246,7 @@ async function replyForCheckInResult(input: {
   if (input.result.status === 'duplicate') {
     const text = input.isAdminCheckIn
       ? `<@${input.actorUserId}> <@${input.targetUserId}>의 오늘 인증은 이미 반영되었어요`
-      : `오늘은 이미 인증 완료했어요 🙂\n사진을 바꾸려면 @봇 변경 을 사용해주세요`;
+      : `오늘은 이미 인증 완료했어요 🙂\n사진을 바꾸려면 ${input.mention} 변경 을 사용해주세요`;
     return sendSlackMessage({
       token: input.token,
       channelId: input.channelId,
@@ -1419,19 +1471,70 @@ function buildGoalInfoText(input: {
   return lines.join('\n');
 }
 
-function buildRegistrationPromptText(input: {
-  goalTitle: string;
-  targetCount: number;
-  penaltyText?: string;
-}) {
+function buildFirstVisitText(mention: string) {
+  return [
+    '처음 오셨네요 👋',
+    '',
+    '닉네임을 먼저 설정해주세요 🙂',
+    '',
+    `${mention} 닉네임 설정 홍길동`,
+    '',
+    '설정 후 운동 인증을 시작할 수 있어요 💪',
+  ].join('\n');
+}
+
+function buildShortGuideText(mention: string) {
+  return [
+    '사용 방법이 필요하신가요? 🙂',
+    '',
+    '아래처럼 입력해 주세요 👇',
+    '',
+    `${mention} 닉네임 설정 홍길동`,
+    `${mention} 인증 + 사진`,
+    `${mention} 목표확인`,
+  ].join('\n');
+}
+
+function buildMissingImageText(mention: string) {
+  return [
+    '사진을 함께 올려주세요 📸',
+    '',
+    '예:',
+    `${mention} 인증 + 사진`,
+  ].join('\n');
+}
+
+function buildRegistrationNamePromptText(mention: string) {
+  return [
+    '이름을 함께 입력해주세요.',
+    '',
+    '예:',
+    `${mention} 닉네임 설정 홍길동`,
+  ].join('\n');
+}
+
+function buildRegistrationPromptText(
+  input: {
+    goalTitle: string;
+    targetCount: number;
+    penaltyText?: string;
+  },
+  mention: string,
+) {
   return [
     buildGoalInfoText(input),
-    '처음 1회만 `@봇 닉네임 설정 이름`으로 등록해주세요. 예: `@봇 닉네임 설정 홍길동`',
+    '',
+    '처음 1회만 닉네임을 설정해주세요 🙂',
+    '',
+    `${mention} 닉네임 설정 홍길동`,
+    '',
+    '설정 후 바로 인증하실 수 있어요 💪',
   ].join('\n');
 }
 
 function buildRegistrationSuccessText(input: {
   displayName: string;
+  mention: string;
   goalTitle: string;
   targetCount: number;
   penaltyText?: string;
@@ -1441,12 +1544,12 @@ function buildRegistrationSuccessText(input: {
     '',
     buildGoalInfoText(input),
     '',
-    '앞으로는 `@봇 인증`과 사진을 함께 올리면 인증됩니다.',
+    `앞으로는 ${input.mention} 인증 + 사진을 함께 올리면 인증됩니다.`,
   ].join('\n');
 }
 
 function buildRegistrationRenameText(input: { displayName: string }) {
-  return `${input.displayName}님, 설정 완료됐어요 👋`;
+  return `이름이 ${input.displayName}님으로 변경되었습니다.`;
 }
 
 function buildCheckInSuccessText(input: {

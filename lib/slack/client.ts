@@ -3,6 +3,10 @@ interface SlackApiResult {
   error?: string;
 }
 
+export function formatSlackMention(userId?: string | null) {
+  return userId ? `<@${userId}>` : '';
+}
+
 export async function sendSlackMessage(input: {
   token?: string | null;
   channelId?: string | null;

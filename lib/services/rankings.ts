@@ -1,6 +1,7 @@
 import { CheckInRecordStatus, IdentityProvider } from '@prisma/client';
 import { getWeekRange } from '@/lib/domain/date';
 import { prisma } from '@/lib/prisma';
+import { formatSlackMention } from '@/lib/slack/client';
 
 export async function getCurrentStatus(input: {
   workspaceId: string;
@@ -124,16 +125,16 @@ export function buildGoalInfoText(input: {
   return lines.join('\n');
 }
 
-export function buildHelpText() {
+export function buildHelpText(botUserId?: string | null) {
+  const mention = formatSlackMention(botUserId);
   return [
-    '사용 방법',
+    '사용 방법 👇',
     '',
-    '@봇',
-    '@봇 닉네임 설정 홍길동',
-    '@봇 인증 + 이미지',
-    '@봇 변경 + 이미지',
-    '@봇 목표확인',
-    '@봇 현황',
+    `${mention} 닉네임 설정 홍길동`,
+    `${mention} 인증 + 사진`,
+    `${mention} 변경 + 사진`,
+    `${mention} 목표확인`,
+    `${mention} 현황`,
   ].join('\n');
 }
 
