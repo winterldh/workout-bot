@@ -1460,7 +1460,7 @@ function getIntentFromCommandText(text: string): SlackIntent | null {
     return 'checkin';
   }
 
-  return 'help';
+  return null;
 }
 
 function parseRegistrationName(text: string) {
