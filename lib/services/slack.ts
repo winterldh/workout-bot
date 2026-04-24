@@ -385,7 +385,7 @@ export async function handleSlackEvent(
         token,
         channelId,
         threadTs: event.ts,
-        text: isFirstInteraction ? onboardingText : buildHelpText(botUserId),
+        text: buildHelpText(botUserId),
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -422,7 +422,7 @@ export async function handleSlackEvent(
         token,
         channelId,
         threadTs: event.ts,
-        text: isFirstInteraction ? onboardingText : shortGuideText,
+        text: shortGuideText,
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -567,6 +567,45 @@ export async function handleSlackEvent(
     }
 
     if (!registrationState.isRegistered) {
+      if (intent === 'checkin' && !slackFileUrl) {
+        const replied = await sendSlackMessage({
+          token,
+          channelId,
+          threadTs: event.ts,
+          text: buildMissingImageText(mention),
+        });
+
+        logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          slackUserId: userId,
+          intent,
+          replyStatus: replied ? 'sent' : 'failed',
+          receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+          ignoredReason: 'missing_image',
+        });
+        await finalizeSlackEventReceipt({
+          eventId: payload.event_id ?? undefined,
+          status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+          intent,
+          ignoredReason: 'missing_image',
+          error: replied ? null : 'reply_failed',
+        }).catch((error) => {
+          logEvent('warn', 'slack.event_receipt_finalize_failed', {
+            eventType: 'slack_checkin',
+            ...context,
+            workspaceId,
+            channelId,
+            slackUserId: userId,
+            intent,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+        return { ok: true, ignored: true, reason: 'missing_image' };
+      }
+
       const replied = await sendSlackMessage({
         token,
         channelId,
