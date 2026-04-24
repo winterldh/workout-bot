@@ -59,6 +59,20 @@ interface SlackMessageEvent {
 
 type SlackIntent = 'checkin' | 'change' | 'admin_checkin' | 'goal_confirm';
 
+export function analyzeSlackIntent(
+  payload: Record<string, any>,
+  event: SlackMessageEvent,
+) {
+  const texts = extractIntentTexts(payload, event);
+  const intent = getIntentFromTexts(texts);
+
+  return {
+    intent,
+    texts,
+    reason: intent ? null : 'no_intent',
+  };
+}
+
 export async function handleSlackEvent(
   payload: Record<string, any>,
   context: LogContext,
@@ -99,11 +113,12 @@ export async function handleSlackEvent(
     return { ok: true, ignored: true };
   }
 
-  const intent = getIntentFromPayload(payload, event);
+  const intentAnalysis = analyzeSlackIntent(payload, event);
+  const intent = intentAnalysis.intent;
   const imageSelection = selectSupportedSlackImageFile(event.files);
   const selectedFile = imageSelection.selectedFile;
   const slackFileUrl = selectedFile?.url_private_download ?? selectedFile?.url_private;
-  const mentionedUserId = extractMentionedUserId(extractPrimaryText(payload, event));
+  const mentionedUserId = extractMentionedUserId(intentAnalysis.texts[0]);
   const isMessage =
     event.type === 'message' && (!event.subtype || event.subtype === 'file_share');
 
@@ -656,9 +671,7 @@ function buildGoalConfirmMessage(input: {
   return lines.join('\n');
 }
 
-function getIntentFromPayload(payload: Record<string, any>, event: SlackMessageEvent): SlackIntent | null {
-  const texts = extractIntentTexts(payload, event);
-
+function getIntentFromTexts(texts: string[]): SlackIntent | null {
   if (texts.some((text) => text.includes('#대신인증'))) {
     return 'admin_checkin';
   }
@@ -672,10 +685,6 @@ function getIntentFromPayload(payload: Record<string, any>, event: SlackMessageE
     return 'checkin';
   }
   return null;
-}
-
-function extractPrimaryText(payload: Record<string, any>, event: SlackMessageEvent) {
-  return extractIntentTexts(payload, event)[0];
 }
 
 function extractIntentTexts(payload: Record<string, any>, event: SlackMessageEvent) {
