@@ -2,7 +2,15 @@ import { SlackEventReceiptStatus } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { logEvent, maskSlackFileUrl, type LogContext } from '@/lib/observability/logger';
 import { createFromSlackMessage, replaceTodayFromSlackMessage } from '@/lib/services/check-ins';
-import { buildStatusText } from '@/lib/services/rankings';
+import {
+  buildChannelStatusText,
+  buildGoalConfirmText,
+  buildHelpText,
+  buildStatusText,
+  buildThreadStatusText,
+  formatProgressBar,
+  getCurrentStatus,
+} from '@/lib/services/rankings';
 import {
   getSlackRegistrationState,
   registerSlackUserFromCommand,
@@ -49,6 +57,7 @@ interface SlackMessageEvent {
   channel?: string;
   text?: string;
   ts?: string;
+  thread_ts?: string;
   client_msg_id?: string;
   username?: string;
   files?: SlackEventFile[];
@@ -59,19 +68,23 @@ interface SlackMessageEvent {
   };
 }
 
-type SlackIntent = 'register' | 'checkin' | 'change' | 'admin_checkin' | 'goal_confirm';
+type SlackIntent = 'register' | 'checkin' | 'change' | 'admin_checkin' | 'goal_confirm' | 'status' | 'help';
 
 export function analyzeSlackIntent(
   payload: Record<string, any>,
   event: SlackMessageEvent,
+  botUserId?: string,
 ) {
   const texts = extractIntentTexts(payload, event);
-  const intent = getIntentFromTexts(texts);
+  const commandText = findMentionedCommandText(texts, botUserId);
+  const normalizedCommandText = commandText ? stripBotMention(commandText, botUserId) : '';
+  const intent = commandText ? getIntentFromCommandText(normalizedCommandText) : null;
 
   return {
     intent,
     texts,
-    reason: intent ? null : 'no_intent',
+    commandText: normalizedCommandText,
+    reason: intent ? null : commandText ? 'unrecognized_command' : 'no_bot_mention',
   };
 }
 
@@ -190,9 +203,13 @@ export async function handleSlackEvent(
   const workspaceId = payload.authorizations?.[0]?.team_id ?? payload.team_id;
   const channelId = event.channel;
   const userId = event.user;
+  const botUserId = process.env.SLACK_BOT_USER_ID?.trim();
   const ignoredActorReason = getIgnoredActorEventReason(event);
+  const isChannelContext =
+    typeof channelId === 'string' && (channelId.startsWith('C') || channelId.startsWith('G'));
+  const isThreadReply = Boolean(event.thread_ts && event.thread_ts !== event.ts);
 
-  if (!workspaceId || !channelId || !userId || ignoredActorReason) {
+  if (!workspaceId || !channelId || !userId || ignoredActorReason || !isChannelContext) {
     logEvent('info', 'slack.ignored_event', {
       eventType: 'slack_checkin',
       ...context,
@@ -206,17 +223,47 @@ export async function handleSlackEvent(
           ? 'missing_channel_id'
           : !userId
             ? 'missing_user_id'
+            : !isChannelContext
+              ? 'non_channel_context'
             : ignoredActorReason ?? 'bot_actor_event',
     });
     return { ok: true, ignored: true };
   }
 
-  const intentAnalysis = analyzeSlackIntent(payload, event);
+  if (isThreadReply) {
+    logEvent('info', 'slack.ignored_event', {
+      eventType: 'slack_checkin',
+      ...context,
+      workspaceId,
+      channelId,
+      slackUserId: userId,
+      ignoredReason: 'thread_reply',
+      reason: 'thread_reply',
+    });
+    return { ok: true, ignored: true };
+  }
+
+  if (!botUserId) {
+    logEvent('warn', 'slack.ignored_event', {
+      eventType: 'slack_checkin',
+      ...context,
+      workspaceId,
+      channelId,
+      slackUserId: userId,
+      ignoredReason: 'missing_bot_user_id',
+      reason: 'missing_bot_user_id',
+    });
+    return { ok: true, ignored: true };
+  }
+
+  const intentAnalysis = analyzeSlackIntent(payload, event, botUserId);
   const intent = intentAnalysis.intent;
+  const commandText = intentAnalysis.commandText;
+  const hasMention = Boolean(commandText || intentAnalysis.reason !== 'no_bot_mention');
   const imageSelection = selectSupportedSlackImageFile(event.files);
   const selectedFile = imageSelection.selectedFile;
   const slackFileUrl = selectedFile?.url_private_download ?? selectedFile?.url_private;
-  const mentionedUserId = extractMentionedUserId(intentAnalysis.texts[0]);
+  const mentionedUserId = extractMentionedUserId(commandText);
   const isMessage = event.type === 'message' && isSupportedMessageSubtype(event.subtype);
 
   if (!isMessage) {
@@ -232,15 +279,15 @@ export async function handleSlackEvent(
     return { ok: true, ignored: true };
   }
 
-  if (!intent) {
+  if (!hasMention) {
     logEvent('info', 'slack.ignored_event', {
       eventType: 'slack_checkin',
       ...context,
       workspaceId,
       channelId,
       slackUserId: userId,
-      ignoredReason: 'no_intent',
-      reason: 'no_intent',
+      ignoredReason: 'no_bot_mention',
+      reason: 'no_bot_mention',
     });
     return { ok: true, ignored: true };
   }
@@ -329,9 +376,88 @@ export async function handleSlackEvent(
       targetCount: integration.goal.targetCount,
       penaltyText: process.env.WEEKLY_PENALTY_TEXT?.trim() || undefined,
     };
+    if (intent === 'help') {
+      const replied = await sendSlackMessage({
+        token,
+        channelId,
+        threadTs: event.ts,
+        text: buildHelpText(),
+      });
+
+      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+        eventType: 'slack_checkin',
+        ...context,
+        workspaceId,
+        channelId,
+        slackUserId: userId,
+        intent,
+        replyStatus: replied ? 'sent' : 'failed',
+        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      });
+      await finalizeSlackEventReceipt({
+        eventId: payload.event_id ?? undefined,
+        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        intent,
+        error: replied ? null : 'reply_failed',
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          slackUserId: userId,
+          intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return { ok: true, replied: true };
+    }
+
+    if (intent === 'status') {
+      const status = await getCurrentStatus({
+        workspaceId,
+        channelId,
+        externalSlackId: userId,
+      });
+
+      const replied = await sendSlackMessage({
+        token,
+        channelId,
+        threadTs: event.ts,
+        text: buildThreadStatusText(status),
+      });
+
+      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+        eventType: 'slack_checkin',
+        ...context,
+        workspaceId,
+        channelId,
+        slackUserId: userId,
+        intent,
+        replyStatus: replied ? 'sent' : 'failed',
+        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      });
+      await finalizeSlackEventReceipt({
+        eventId: payload.event_id ?? undefined,
+        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        intent,
+        error: replied ? null : 'reply_failed',
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          slackUserId: userId,
+          intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return { ok: true, replied: true };
+    }
 
     if (intent === 'register') {
-      const registrationName = parseRegistrationName(intentAnalysis.texts);
+      const registrationName = parseRegistrationName(commandText);
       if (registrationName) {
         if (registrationState.isRegistered) {
           await renameSlackUserFromCommand({
@@ -363,7 +489,7 @@ export async function handleSlackEvent(
                 displayName: registrationName,
                 ...goalInfo,
               })
-          : '이름을 함께 입력해주세요. 예: `#등록 홍길동`',
+          : '이름을 함께 입력해주세요. 예: `@봇 닉네임 설정 홍길동`',
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -404,7 +530,7 @@ export async function handleSlackEvent(
         text:
           intent === 'goal_confirm'
             ? buildRegistrationPromptText(goalInfo)
-            : '처음 1회만 `#등록 이름`으로 등록해주세요. 예: `#등록 홍길동`',
+            : '먼저 닉네임을 설정해주세요 🙂\n\n예: `@봇 닉네임 설정 홍길동`',
       });
 
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
@@ -439,13 +565,25 @@ export async function handleSlackEvent(
     }
 
   if (intent === 'goal_confirm') {
+    const status = await getCurrentStatus({
+      workspaceId,
+      channelId,
+      externalSlackId: userId,
+    });
+
     const replied = await sendSlackMessage({
       token,
       channelId,
       threadTs: event.ts,
-      text: registrationState.isRegistered
-        ? buildGoalInfoText(goalInfo)
-        : buildRegistrationPromptText(goalInfo),
+      text: status && status.me
+        ? buildGoalConfirmText({
+            goalTitle: goalInfo.goalTitle,
+            targetCount: goalInfo.targetCount,
+            penaltyText: goalInfo.penaltyText,
+            displayName: status.me.displayName,
+            count: status.me.count,
+          })
+        : `${buildGoalInfoText(goalInfo)}\n\n이번 주 현황을 불러오지 못했어요. 잠시 후 다시 시도해주세요.`,
     });
 
     logEvent('info', 'slack.reply_sent', {
@@ -477,7 +615,7 @@ export async function handleSlackEvent(
       });
     });
 
-    return { ok: true, registered: true };
+    return { ok: true, replied: true };
   }
 
   if (intent === 'change') {
@@ -719,7 +857,7 @@ export async function handleSlackEvent(
         token,
         channelId,
         threadTs: event.ts,
-        text: `<@${targetUserId}>님은 아직 등록되지 않았어요. 먼저 \`#등록 이름\`으로 등록해주세요.`,
+        text: `<@${targetUserId}>님은 아직 등록되지 않았어요. 먼저 \`@봇 닉네임 설정 이름\`으로 등록해주세요.`,
       });
       logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
         eventType: 'slack_checkin',
@@ -833,6 +971,28 @@ export async function handleSlackEvent(
       });
     }
 
+    let currentStatusForAccepted: Awaited<ReturnType<typeof getCurrentStatus>> | null = null;
+    if (result.status === 'accepted') {
+      currentStatusForAccepted = await getCurrentStatus({
+        workspaceId,
+        channelId,
+        externalSlackId: targetUserId ?? userId,
+      }).catch((error) => {
+        logEvent('warn', 'slack.current_status_load_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          groupId: integration.groupId,
+          goalId: integration.goalId,
+          slackUserId: targetUserId ?? userId,
+          reason: error instanceof Error ? error.message : String(error),
+          stage: 'accepted_reply',
+        });
+        return null;
+      });
+    }
+
     if (result.status === 'duplicate') {
       logEvent('info', 'slack.checkin_duplicate', {
         type: 'checkin',
@@ -859,7 +1019,29 @@ export async function handleSlackEvent(
       displayName: targetDisplayName,
       result,
       isAdminCheckIn: intent === 'admin_checkin',
+      currentStatus: currentStatusForAccepted ?? undefined,
     });
+
+    if (result.status === 'accepted' && currentStatusForAccepted) {
+      const channelUpdateText = buildChannelStatusText(currentStatusForAccepted);
+      const channelUpdateSent = await sendSlackMessage({
+        token,
+        channelId,
+        text: channelUpdateText,
+      });
+      logEvent(channelUpdateSent ? 'info' : 'warn', channelUpdateSent ? 'slack.channel_update_sent' : 'slack.channel_update_failed', {
+        eventType: 'slack_checkin',
+        ...context,
+        workspaceId,
+        channelId,
+        groupId: integration.groupId,
+        goalId: integration.goalId,
+        slackUserId: targetUserId ?? userId,
+        intent,
+        replyStatus: channelUpdateSent ? 'sent' : 'failed',
+      });
+    }
+
     logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
       eventType: 'slack_checkin',
       ...context,
@@ -942,7 +1124,6 @@ export async function handleStatusCommand(payload: Record<string, string>) {
         workspaceId: payload.team_id,
         channelId: payload.channel_id,
         externalSlackId: payload.user_id,
-        externalSlackUsername: payload.user_name,
       }),
     };
   } catch (error) {
@@ -987,13 +1168,14 @@ async function replyForCheckInResult(input: {
   displayName: string;
   result: Awaited<ReturnType<typeof createFromSlackMessage>>;
   isAdminCheckIn: boolean;
+  currentStatus?: Awaited<ReturnType<typeof getCurrentStatus>>;
 }) {
   if (input.result.status === 'registration_required') {
     return sendSlackMessage({
       token: input.token,
       channelId: input.channelId,
       threadTs: input.threadTs,
-      text: '처음 1회만 `#등록 이름`으로 등록해주세요. 예: `#등록 홍길동`',
+      text: '먼저 닉네임을 설정해주세요 🙂\n\n예: `@봇 닉네임 설정 홍길동`',
     });
   }
 
@@ -1002,16 +1184,17 @@ async function replyForCheckInResult(input: {
       token: input.token,
       channelId: input.channelId,
       threadTs: input.threadTs,
-      text: buildCheckInSuccessText({ displayName: input.displayName }),
+      text: buildCheckInSuccessText({
+        displayName: input.displayName,
+        currentStatus: input.currentStatus,
+      }),
     });
   }
 
   if (input.result.status === 'duplicate') {
     const text = input.isAdminCheckIn
       ? `<@${input.actorUserId}> <@${input.targetUserId}>의 오늘 인증은 이미 반영되었어요`
-      : input.result.candidateSaved
-        ? `${input.displayName}님 오늘 인증은 이미 반영되었어요\n이 사진으로 변경하려면 #변경을 입력해주세요`
-        : `${input.displayName}님 오늘 인증은 이미 반영되었어요`;
+      : `오늘은 이미 인증 완료했어요 🙂\n사진을 바꾸려면 @봇 변경 을 사용해주세요`;
     return sendSlackMessage({
       token: input.token,
       channelId: input.channelId,
@@ -1152,61 +1335,76 @@ async function validateAdminProxyRequest(input: {
   return { ok: true as const };
 }
 
-function buildGoalConfirmMessage(input: {
-  userId: string;
-  goalTitle: string;
-  targetCount: number;
-  penaltyText?: string;
-  isNewUser: boolean;
-}) {
-  const lines = [
-    input.isNewUser
-      ? `<@${input.userId}> 등록되었어요`
-      : `<@${input.userId}> 이미 등록되어 있어요`,
-    `현재 목표: ${input.goalTitle} ${input.targetCount}회`,
-    '#인증 을 입력하고 사진을 올리면 그날의 운동 인증 완료!',
-  ];
-
-  if (input.penaltyText) {
-    lines.push(`현재 패널티: ${input.penaltyText}`);
+function getIntentFromCommandText(text: string): SlackIntent | null {
+  const normalized = text.trim();
+  if (!normalized) {
+    return 'help';
   }
 
-  return lines.join('\n');
-}
+  if (/^(help|도움말)$/i.test(normalized)) {
+    return 'help';
+  }
 
-function getIntentFromTexts(texts: string[]): SlackIntent | null {
-  if (texts.some((text) => text.includes('#등록'))) {
-    return 'register';
+  if (/^(현황)(?:\s+.*)?$/.test(normalized)) {
+    return 'status';
   }
-  if (texts.some((text) => text.includes('#대신인증'))) {
-    return 'admin_checkin';
-  }
-  if (texts.some((text) => text.includes('#변경'))) {
-    return 'change';
-  }
-  if (texts.some((text) => text.includes('#목표확인'))) {
+
+  if (/^(목표확인)(?:\s+.*)?$/.test(normalized)) {
     return 'goal_confirm';
   }
-  if (texts.some((text) => containsCheckinIntent(text))) {
+
+  if (/^(닉네임\s*설정|등록)(?:\s+.+)?$/.test(normalized)) {
+    return 'register';
+  }
+
+  if (/^(변경)(?:\s+.*)?$/.test(normalized)) {
+    return 'change';
+  }
+
+  if (/^(대신인증)(?:\s+.*)?$/.test(normalized) || normalized.includes('#대신인증')) {
+    return 'admin_checkin';
+  }
+
+  if (containsCheckinIntent(normalized)) {
     return 'checkin';
   }
-  return null;
+
+  return 'help';
 }
 
-function parseRegistrationName(texts: string[]) {
-  for (const text of texts) {
-    const exactMatch = text.match(/^#등록(?:\s+(.+))?$/);
-    if (exactMatch) {
-      return exactMatch[1]?.trim() ?? '';
-    }
+function parseRegistrationName(text: string) {
+  const normalized = stripBotMention(text, process.env.SLACK_BOT_USER_ID?.trim());
+  const match = normalized.match(/^(?:닉네임\s*설정|등록)\s+(.+)$/);
+  return match?.[1]?.trim() ?? '';
+}
 
-    const looseMatch = text.match(/#등록\s+(.+)$/);
-    if (looseMatch) {
-      return looseMatch[1]?.trim() ?? '';
-    }
+function findMentionedCommandText(texts: string[], botUserId?: string) {
+  if (!botUserId) {
+    return null;
   }
 
-  return '';
+  return texts.find((text) => containsBotMention(text, botUserId)) ?? null;
+}
+
+function stripBotMention(text: string, botUserId?: string) {
+  if (!botUserId) {
+    return text.trim();
+  }
+
+  const mentionPattern = new RegExp(`<@${escapeRegExp(botUserId)}>`, 'g');
+  return text.replace(mentionPattern, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function containsBotMention(text: string, botUserId?: string) {
+  if (!botUserId) {
+    return false;
+  }
+
+  return text.includes(`<@${botUserId}>`);
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function buildGoalInfoText(input: {
@@ -1214,9 +1412,9 @@ function buildGoalInfoText(input: {
   targetCount: number;
   penaltyText?: string;
 }) {
-  const lines = [`현재 목표: ${input.goalTitle} ${input.targetCount}회`];
+  const lines = [`현재 목표: ${input.goalTitle}`];
   if (input.penaltyText) {
-    lines.push(`패널티: ${input.penaltyText}`);
+    lines.push(`미달성 시 패널티: ${input.penaltyText}`);
   }
   return lines.join('\n');
 }
@@ -1228,7 +1426,7 @@ function buildRegistrationPromptText(input: {
 }) {
   return [
     buildGoalInfoText(input),
-    '처음 1회만 `#등록 이름`으로 등록해주세요. 예: `#등록 홍길동`',
+    '처음 1회만 `@봇 닉네임 설정 이름`으로 등록해주세요. 예: `@봇 닉네임 설정 홍길동`',
   ].join('\n');
 }
 
@@ -1239,18 +1437,35 @@ function buildRegistrationSuccessText(input: {
   penaltyText?: string;
 }) {
   return [
-    `${input.displayName}님 등록되었습니다.`,
+    `${input.displayName}님, 설정 완료됐어요 👋`,
+    '',
     buildGoalInfoText(input),
-    '앞으로는 `#인증`과 사진을 함께 올리면 인증됩니다.',
+    '',
+    '앞으로는 `@봇 인증`과 사진을 함께 올리면 인증됩니다.',
   ].join('\n');
 }
 
 function buildRegistrationRenameText(input: { displayName: string }) {
-  return `이름이 ${input.displayName}님으로 변경되었습니다.`;
+  return `${input.displayName}님, 설정 완료됐어요 👋`;
 }
 
-function buildCheckInSuccessText(input: { displayName: string }) {
-  return `${input.displayName}님, 오늘 운동 인증 완료!`;
+function buildCheckInSuccessText(input: {
+  displayName: string;
+  currentStatus?: Awaited<ReturnType<typeof getCurrentStatus>> | null;
+}) {
+  if (!input.currentStatus || !input.currentStatus.me) {
+    return `${input.displayName}님, 오늘 인증 완료 💪`;
+  }
+
+  const remaining = Math.max(input.currentStatus.targetCount - input.currentStatus.me.count, 0);
+  return [
+    `${input.displayName}님, 오늘 인증 완료 💪`,
+    '',
+    '이번 주 진행도',
+    `${formatProgressBar(input.currentStatus.me.count, input.currentStatus.targetCount)} ${input.currentStatus.me.count}/${input.currentStatus.targetCount}`,
+    '',
+    remaining > 0 ? `목표까지 ${remaining}회 남았어요` : '목표 달성했어요 🎉',
+  ].join('\n');
 }
 
 function extractIntentTexts(payload: Record<string, any>, event: SlackMessageEvent) {

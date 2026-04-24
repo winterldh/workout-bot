@@ -1,4 +1,4 @@
-import { getCurrentStatus } from '@/lib/services/rankings';
+import { formatProgressBar, getCurrentStatus } from '@/lib/services/rankings';
 
 export const dynamic = 'force-dynamic';
 
@@ -31,7 +31,10 @@ export default async function RankingPage() {
           <ol>
             {status.ranking.map((entry) => (
               <li key={entry.userId}>
-                {entry.displayName} {entry.count} / {entry.targetCount}
+                {entry.displayName}{' '}
+                {entry.count >= entry.targetCount
+                  ? formatProgressBar(entry.count, entry.targetCount)
+                  : `${formatProgressBar(entry.count, entry.targetCount)} ${entry.count}/${entry.targetCount}`}
               </li>
             ))}
           </ol>

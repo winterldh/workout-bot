@@ -116,15 +116,17 @@ npm run prisma:seed
 
 ## Slack 동작
 
-- `#등록 이름`: Slack userId 기준으로 내부 사용자 등록 또는 displayName 변경을 처리합니다.
-- `#목표확인`: 등록 트리거가 아니며 현재 목표/패널티 안내만 반환합니다.
-- 미등록 유저의 `#인증` + 이미지: 저장하지 않고 `#등록 이름` 안내만 반환합니다.
-- 등록 유저의 `#인증` + 이미지: RawSubmission, SubmissionAsset, CheckInRecord를 저장합니다.
+- 채널 메시지 중 `@봇` 멘션이 포함된 메시지만 처리합니다.
+- DM, thread reply, bot message, `message_changed`, `message_deleted`는 무시합니다.
+- `@봇 닉네임 설정 홍길동`: Slack userId 기준 내부 사용자 등록 또는 displayName 변경을 처리합니다.
+- `@봇 인증 + 이미지`: 등록 유저만 저장하고, 성공 시 스레드 피드백 + 채널 현황 업데이트를 전송합니다.
+- `@봇 변경 + 이미지`: 오늘 인증 이미지를 교체 요청합니다.
+- `@봇 목표확인`: 현재 목표/패널티와 내 진행도를 스레드로 반환합니다.
+- `@봇 현황`: 이번 주 전체 현황을 스레드로 반환합니다.
+- `@봇`: 사용 방법 안내를 스레드로 반환합니다.
 - Slack 이미지는 `SLACK_BOT_TOKEN`으로 다운로드한 뒤 Vercel Blob에 업로드하고, DB에는 `blobUrl`에 저장합니다.
 - Slack 원본 파일 URL은 `slackOriginalUrl`에 보관합니다. 기존 `originalUrl`, `originalPhotoUrl`, `imageUrl`은 호환용 legacy 필드입니다.
 - 동일 `goalId + userId + recordDate` 중복: SlackChangeCandidate를 upsert합니다.
-- `#변경`: 저장된 SlackChangeCandidate 이미지로 오늘 인증 이미지를 교체합니다.
-- `/현황`: 이번 주 멤버별 인증 횟수와 목표 달성 현황을 반환합니다.
 
 ### 업로드 실패 fallback
 
@@ -142,20 +144,23 @@ npm run prisma:seed
 
 ### 검증 시나리오
 
-- 미등록 `#등록 이름`: 등록 생성 또는 displayName 변경 후 1회 안내
-- 미등록 `#목표확인`: 목표/패널티 + `#등록 이름` 안내
-- 미등록 `#인증` + 이미지: 저장 없이 `#등록 이름` 안내
-- 등록 `#인증` + 이미지 1장: `RawSubmission` / `SubmissionAsset` / `CheckInRecord` 생성
-- 등록 `#인증` + 이미지 여러 장: 첫 번째 지원 이미지로 생성
-- 등록 `#인증` 텍스트만: 저장 없이 안내 메시지
-- 중복 인증: `SlackChangeCandidate` upsert
+- `@봇 닉네임 설정 홍길동`: 등록 생성 또는 displayName 변경 후 1회 스레드 안내
+- `@봇 목표확인`: 목표/패널티 + 개인 진행도 1회 스레드 안내
+- `@봇 인증` + 이미지: 등록 유저는 저장 후 스레드 피드백 + 채널 현황 업데이트
+- 같은 날 `@봇 인증` + 다른 이미지: duplicate 스레드 피드백, 채널 업데이트 없음
+- `@봇 변경` + 이미지: 변경 요청 스레드 안내
+- `@봇 현황`: 전체 현황 스레드 안내
+- 멘션 없이 인증/사진만: 무시
+- retry 이벤트: `SlackEventReceipt` 기준 중복 없음
+- bot message / thread reply / message_changed / message_deleted: 무시
 - Blob 업로드 실패: Slack URL fallback 저장 및 `slack.asset_upload_fallback` 로그 확인
 
 ### 운영 점검 포인트
 
 - Slack event URL이 `/api/slack/events`로 연결됐는지 확인합니다.
 - `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`, `BLOB_READ_WRITE_TOKEN` 누락 여부를 먼저 확인합니다.
-- Slack 사용자 이름은 `users.info`로 자동 조회하지 않고, `#등록 이름` 입력으로만 관리합니다.
+- Slack 사용자 이름은 `users.info`로 자동 조회하지 않고, `@봇 닉네임 설정 이름` 입력으로만 관리합니다.
+- Slack 이벤트는 `SLACK_BOT_USER_ID` 멘션이 있어야만 처리합니다.
 - 이상 시 `requestId` / `eventId` 기준으로 `slack.*` JSON 로그를 따라가면 됩니다.
 - Blob 업로드 실패가 반복되면 Slack 토큰 권한과 Vercel Blob 토큰을 우선 점검합니다.
 - weekly report는 `WeeklyReportRun` 테이블의 `runKey`로 중복 실행을 막고, 30분 이상 오래된 RUNNING 상태만 재시도합니다.
@@ -164,6 +169,18 @@ npm run prisma:seed
 
 - Event Subscriptions URL: `https://<vercel-domain>/api/slack/events`
 - Slash Command URL: `https://<vercel-domain>/api/slack/commands/status`
+
+### 진행도 표시
+
+- `formatProgressBar(count, targetCount)`는 `◻︎`와 `◼︎`로 진행도를 표시합니다.
+- 예: `0/3 -> ◻︎◻︎◻︎`, `1/3 -> ◼︎◻︎◻︎`, `2/3 -> ◼︎◼︎◻︎`, `3/3 -> ◼︎◼︎◼︎ 달성!`
+- 스레드와 채널 현황은 `◼︎◼︎◻︎ 2/3` 같은 형태로 표시됩니다.
+
+### 채널 vs 스레드
+
+- 개인 피드백은 스레드로 보냅니다.
+- 인증 성공 시에만 채널에 전체 현황 메시지를 추가로 보냅니다.
+- `@봇 현황`, `@봇 목표확인`, `@봇`, `@봇 닉네임 설정`은 스레드 응답만 사용합니다.
 
 ### 배포 후 확인 절차
 

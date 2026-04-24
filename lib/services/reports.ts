@@ -15,22 +15,27 @@ export async function buildWeeklyReportText(input: {
   const lastWeekStart = addUtcDays(currentWeek.startDate, -7);
   const lastWeekEnd = addUtcDays(currentWeek.startDate, -1);
 
-  const [records, memberships] = await Promise.all([
-    prisma.checkInRecord.findMany({
-      where: {
-        goalId: input.goalId,
-        status: CheckInRecordStatus.APPROVED,
-        recordDate: { gte: lastWeekStart, lte: lastWeekEnd },
-      },
-      include: { user: true },
-      orderBy: [{ recordDate: 'asc' }, { createdAt: 'asc' }],
-    }),
-    prisma.groupMembership.findMany({
-      where: { groupId: input.groupId },
-      include: { user: true },
-      orderBy: [{ role: 'asc' }, { joinedAt: 'asc' }],
-    }),
-  ]);
+  const records = await prisma.checkInRecord.findMany({
+    where: {
+      goalId: input.goalId,
+      status: CheckInRecordStatus.APPROVED,
+      recordDate: { gte: lastWeekStart, lte: lastWeekEnd },
+    },
+    select: {
+      userId: true,
+      user: { select: { displayName: true } },
+    },
+    orderBy: [{ recordDate: 'asc' }, { createdAt: 'asc' }],
+  });
+
+  const memberships = await prisma.groupMembership.findMany({
+    where: { groupId: input.groupId },
+    select: {
+      userId: true,
+      user: { select: { displayName: true } },
+    },
+    orderBy: [{ role: 'asc' }, { joinedAt: 'asc' }],
+  });
 
   const counts = new Map<string, { displayName: string; count: number }>();
   for (const record of records) {
@@ -54,29 +59,38 @@ export async function buildWeeklyReportText(input: {
         left.displayName.localeCompare(right.displayName),
     );
 
-  if (memberResults.length === 0) {
-    return ['지난주 운동 결과 확인해보세요!', '아직 참여자가 없어요', '이번 주도 화이팅'].join('\n');
-  }
+  const achievedMembers = memberResults.filter((entry) => entry.count >= input.targetCount);
+  const missedMembers = memberResults.filter((entry) => entry.count < input.targetCount);
 
-  const lines = ['지난주 운동 결과 확인해보세요!'];
-  const underTargetMembers = memberResults
-    .filter((entry) => entry.count < input.targetCount)
-    .map((entry) => entry.displayName);
+  const lines = ['📅 지난주 운동 결과', ''];
 
-  if (underTargetMembers.length > 0) {
-    lines.push(`미달성자: ${underTargetMembers.join(', ')}`);
-    if (process.env.WEEKLY_PENALTY_TEXT) {
-      lines.push(`-> ${process.env.WEEKLY_PENALTY_TEXT}`);
-    }
+  lines.push('✅ 목표 달성');
+  if (achievedMembers.length === 0) {
+    lines.push('- 없음');
   } else {
-    lines.push('모두 목표를 달성했어요.');
+    achievedMembers.forEach((entry) => {
+      lines.push(`${entry.displayName} (${entry.count}/${input.targetCount})`);
+    });
   }
 
-  lines.push('');
-  memberResults.forEach((entry) => {
-    lines.push(`${entry.displayName} ${entry.count}회/${input.targetCount}회`);
-  });
-  lines.push('', '이번 주도 화이팅');
+  lines.push('', '❌ 미달성');
+  if (missedMembers.length === 0) {
+    lines.push('- 없음');
+  } else {
+    missedMembers.forEach((entry) => {
+      lines.push(`${entry.displayName} (${entry.count}/${input.targetCount})`);
+    });
+  }
+
+  lines.push('', '패널티 대상');
+  if (missedMembers.length === 0) {
+    lines.push('- 없음');
+  } else {
+    missedMembers.forEach((entry) => {
+      const penaltyText = process.env.WEEKLY_PENALTY_TEXT?.trim() || '패널티 없음';
+      lines.push(`- ${entry.displayName} ${penaltyText}`);
+    });
+  }
 
   return lines.join('\n');
 }
