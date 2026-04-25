@@ -49,10 +49,26 @@ enum WeeklyReportRunStatus {
 }
 
 enum SlackEventReceiptStatus {
+  RECEIVED
+  ACKED
   PROCESSING
   DONE
   FAILED
   SKIPPED
+}
+
+enum SlackEventJobStatus {
+  PENDING
+  PROCESSING
+  DONE
+  FAILED
+}
+
+enum SlackEventJobResultStatus {
+  ACCEPTED
+  DUPLICATE
+  IGNORED
+  REPLIED
 }
 
 enum SubmissionAssetKind {
@@ -201,28 +217,68 @@ model SlackIntegration {
 }
 
 model SlackEventReceipt {
-  id            String               @id @default(cuid())
-  eventId       String               @unique
-  requestId     String?
-  workspaceId   String
-  channelId     String
-  slackUserId   String?
-  eventType     String
-  intent        String?
-  status        SlackEventReceiptStatus @default(PROCESSING)
-  startedAt     DateTime             @default(now())
-  finishedAt    DateTime?
-  lastError     String?
-  retryCount    Int                  @default(0)
-  retryNum      Int?
-  retryReason   String?
+  id          String                 @id @default(cuid())
+  eventId     String                 @unique
+  requestId   String?
+  workspaceId String
+  channelId   String
+  slackUserId String?
+  eventType   String?
+  intent      String?
+  retryNum    Int?
+  retryReason String?
+  status      SlackEventReceiptStatus @default(RECEIVED)
+  startedAt   DateTime               @default(now())
+  finishedAt  DateTime?
+  lastError   String?
+  retryCount  Int                  @default(0)
   ignoredReason String?
-  error         String?
-  processedAt   DateTime?
-  createdAt     DateTime             @default(now())
-  updatedAt     DateTime             @updatedAt
+  error       String?
+  processedAt DateTime?
+  receivedAt  DateTime               @default(now())
+  ackAt       DateTime?
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  job         SlackEventJob?
 
-  @@index([workspaceId, channelId, createdAt])
+  @@unique([workspaceId, eventId])
+  @@index([workspaceId, channelId, receivedAt])
+}
+
+model SlackEventJob {
+  id                    String                    @id @default(cuid())
+  receiptId             String?                   @unique
+  eventId               String                    @unique
+  workspaceId           String
+  channelId             String
+  slackUserId           String?
+  groupId               String?
+  goalId                String?
+  intent                String?
+  resultStatus          SlackEventJobResultStatus?
+  payload               Json
+  status                SlackEventJobStatus       @default(PENDING)
+  attempts              Int                       @default(0)
+  lockedAt              DateTime?
+  processingStartedAt   DateTime?
+  processedAt           DateTime?
+  nextRetryAt           DateTime?
+  lastError             String?
+  checkInRecordId       String?
+  rawSubmissionId       String?
+  submissionAssetId     String?
+  changeCandidateId     String?
+  replySentAt           DateTime?
+  channelStatusSentAt   DateTime?
+  assetUploadedAt       DateTime?
+  createdAt             DateTime                  @default(now())
+  updatedAt             DateTime                  @updatedAt
+  receipt               SlackEventReceipt?        @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, eventId])
+  @@index([status, nextRetryAt, lockedAt])
+  @@index([workspaceId, channelId, status, createdAt])
+  @@index([groupId, status, createdAt])
 }
 
 model RawSubmission {

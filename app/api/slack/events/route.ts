@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { handleSlackEvent } from '@/lib/services/slack';
+import {
+  ackSlackEventReceipt,
+  enqueueSlackEventJob,
+  scheduleSlackEventJobProcessing,
+} from '@/lib/services/slack-event-jobs';
 import { logEvent } from '@/lib/observability/logger';
 import { SlackRequestError, verifySlackSignature } from '@/lib/slack/signature';
 import { randomUUID } from 'node:crypto';
+import { after } from 'next/server';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -64,8 +69,33 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const result = await handleSlackEvent(payload, eventContext);
-    return NextResponse.json(result ?? { ok: true, received: true });
+    if (payload.type === 'event_callback') {
+      const { receipt, job } = await enqueueSlackEventJob({
+        payload,
+        requestId,
+        retryNum,
+        retryReason,
+      });
+
+      if (receipt) {
+        await ackSlackEventReceipt({ receiptId: receipt.id }).catch((error) => {
+          logEvent('warn', 'slack.receipt_ack_failed', {
+            eventType: 'slack_event',
+            requestId,
+            eventId: payload.event_id ?? null,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+
+      after(() => {
+        void scheduleSlackEventJobProcessing({ jobId: job?.id });
+      });
+
+      return NextResponse.json({ ok: true, received: true });
+    }
+
+    return NextResponse.json({ ok: true, received: true });
   } catch (error) {
     if (error instanceof SlackRequestError) {
       logEvent('warn', 'slack.signature_verification_failed', {

@@ -6,6 +6,9 @@ export interface LogContext {
   retryNum?: string | null;
   retryReason?: string | null;
   receiptId?: string;
+  jobId?: string;
+  jobStatus?: string | null;
+  jobStep?: string | null;
   workspaceId?: string;
   channelId?: string;
   groupId?: string;
