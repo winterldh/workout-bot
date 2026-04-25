@@ -50,7 +50,7 @@ enum WeeklyReportRunStatus {
 
 enum SlackEventReceiptStatus {
   PROCESSING
-  COMPLETED
+  DONE
   FAILED
   SKIPPED
 }
@@ -210,6 +210,10 @@ model SlackEventReceipt {
   eventType     String
   intent        String?
   status        SlackEventReceiptStatus @default(PROCESSING)
+  startedAt     DateTime             @default(now())
+  finishedAt    DateTime?
+  lastError     String?
+  retryCount    Int                  @default(0)
   retryNum      Int?
   retryReason   String?
   ignoredReason String?

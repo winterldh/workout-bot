@@ -1,7 +1,13 @@
 import { SlackEventReceiptStatus } from '@prisma/client';
+import { after } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { logEvent, maskSlackFileUrl, type LogContext } from '@/lib/observability/logger';
-import { createFromSlackMessage, replaceTodayFromSlackMessage } from '@/lib/services/check-ins';
+import {
+  createFromSlackMessage,
+  replaceTodayFromSlackMessage,
+  updateSlackChangeCandidateAsset,
+  updateSlackSubmissionAsset,
+} from '@/lib/services/check-ins';
 import {
   buildChannelStatusText,
   buildGoalConfirmText,
@@ -108,8 +114,18 @@ export function analyzeSlackIntent(
 }
 
 type SlackEventReceiptRecord = {
+  id: string;
   eventId: string;
   status: SlackEventReceiptStatus;
+  startedAt: Date;
+  retryCount: number;
+};
+
+type SlackEventReceiptClaimResult = {
+  receipt: SlackEventReceiptRecord | null;
+  duplicate: boolean;
+  staleRetry: boolean;
+  processing?: boolean;
 };
 
 async function claimSlackEventReceipt(input: {
@@ -121,10 +137,13 @@ async function claimSlackEventReceipt(input: {
   channelId: string;
   slackUserId?: string;
   eventType: string;
-}) {
+}): Promise<SlackEventReceiptClaimResult> {
   if (!input.eventId) {
-    return { receipt: null as SlackEventReceiptRecord | null, duplicate: false };
+    return { receipt: null as SlackEventReceiptRecord | null, duplicate: false, staleRetry: false };
   }
+
+  const now = new Date();
+  const staleThresholdMs = 2 * 60 * 1000;
 
   try {
     const receipt = await prisma.slackEventReceipt.create({
@@ -138,21 +157,101 @@ async function claimSlackEventReceipt(input: {
         retryNum: toPositiveInteger(input.retryNum),
         retryReason: input.retryReason ?? null,
         status: SlackEventReceiptStatus.PROCESSING,
+        startedAt: now,
+        retryCount: 0,
       },
       select: {
+        id: true,
         eventId: true,
         status: true,
+        startedAt: true,
+        retryCount: true,
       },
     });
 
-    return { receipt, duplicate: false };
+    return { receipt, duplicate: false, staleRetry: false };
   } catch (error) {
     if (isUniqueConstraintError(error)) {
       const receipt = await prisma.slackEventReceipt.findUnique({
         where: { eventId: input.eventId },
-        select: { eventId: true, status: true },
+        select: { id: true, eventId: true, status: true, startedAt: true, retryCount: true },
       });
-      return { receipt, duplicate: true };
+
+      if (!receipt) {
+        return { receipt: null as SlackEventReceiptRecord | null, duplicate: true, staleRetry: false };
+      }
+
+      if (receipt.status === SlackEventReceiptStatus.DONE) {
+        return {
+          receipt,
+          duplicate: true,
+          staleRetry: false,
+        };
+      }
+
+      if (receipt.status === SlackEventReceiptStatus.PROCESSING) {
+        const isStale = now.getTime() - receipt.startedAt.getTime() > staleThresholdMs;
+        if (!isStale) {
+          return {
+            receipt,
+            duplicate: false,
+            staleRetry: false,
+            processing: true,
+          };
+        }
+
+        const resumed = await prisma.slackEventReceipt.update({
+          where: { eventId: input.eventId },
+          data: {
+            status: SlackEventReceiptStatus.PROCESSING,
+            startedAt: now,
+            retryCount: receipt.retryCount + 1,
+            requestId: input.requestId,
+            slackUserId: input.slackUserId,
+            retryNum: toPositiveInteger(input.retryNum),
+            retryReason: input.retryReason ?? null,
+            lastError: null,
+            finishedAt: null,
+          },
+          select: { id: true, eventId: true, status: true, startedAt: true, retryCount: true },
+        });
+
+        return {
+          receipt: resumed,
+          duplicate: false,
+          staleRetry: true,
+        };
+      }
+
+      if (receipt.status === SlackEventReceiptStatus.FAILED) {
+        const resumed = await prisma.slackEventReceipt.update({
+          where: { eventId: input.eventId },
+          data: {
+            status: SlackEventReceiptStatus.PROCESSING,
+            startedAt: now,
+            retryCount: receipt.retryCount + 1,
+            requestId: input.requestId,
+            slackUserId: input.slackUserId,
+            retryNum: toPositiveInteger(input.retryNum),
+            retryReason: input.retryReason ?? null,
+            lastError: null,
+            finishedAt: null,
+          },
+          select: { id: true, eventId: true, status: true, startedAt: true, retryCount: true },
+        });
+
+        return {
+          receipt: resumed,
+          duplicate: false,
+          staleRetry: true,
+        };
+      }
+
+      return {
+        receipt,
+        duplicate: true,
+        staleRetry: false,
+      };
     }
 
     throw error;
@@ -178,7 +277,9 @@ async function finalizeSlackEventReceipt(input: {
       intent: input.intent ?? undefined,
       ignoredReason: input.ignoredReason ?? undefined,
       error: input.error ?? undefined,
+      lastError: input.error ?? undefined,
       processedAt: input.processedAt ?? new Date(),
+      finishedAt: input.processedAt ?? new Date(),
     },
   });
 }
@@ -327,8 +428,35 @@ export async function handleSlackEvent(
     eventType: event.type ?? 'message',
   });
 
+  if (receiptClaim.processing) {
+    logEvent('info', 'slack.receipt_processing', {
+      eventType: 'slack_checkin',
+      ...context,
+      workspaceId,
+      channelId,
+      slackUserId: userId,
+      intent,
+      receiptStatus: receiptClaim.receipt?.status ?? 'PROCESSING',
+      reason: 'processing_in_progress',
+    });
+    return { ok: true, ignored: true, reason: 'processing_in_progress' };
+  }
+
+  if (receiptClaim.staleRetry) {
+    logEvent('info', 'slack.receipt_stale_retry', {
+      eventType: 'slack_checkin',
+      ...context,
+      workspaceId,
+      channelId,
+      slackUserId: userId,
+      intent,
+      receiptStatus: receiptClaim.receipt?.status ?? 'PROCESSING',
+      retryCount: receiptClaim.receipt?.retryCount ?? 0,
+    });
+  }
+
   if (receiptClaim.duplicate) {
-    logEvent('info', 'slack.event_duplicate_ignored', {
+    logEvent('info', 'slack.receipt_duplicate_done', {
       eventType: 'slack_checkin',
       ...context,
       workspaceId,
@@ -386,12 +514,12 @@ export async function handleSlackEvent(
       slackUserId: userId,
       intent,
       replyStatus: replied ? 'sent' : 'failed',
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       ignoredReason: 'settings_channel_only',
     });
     await finalizeSlackEventReceipt({
       eventId: payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent,
       ignoredReason: 'settings_channel_only',
       error: replied ? null : 'reply_failed',
@@ -422,7 +550,7 @@ export async function handleSlackEvent(
     });
     await finalizeSlackEventReceipt({
       eventId: payload.event_id ?? undefined,
-      status: SlackEventReceiptStatus.SKIPPED,
+      status: SlackEventReceiptStatus.DONE,
       intent: intent ?? null,
       ignoredReason: 'dm_non_settings',
     }).catch((error) => {
@@ -454,7 +582,7 @@ export async function handleSlackEvent(
       });
       await finalizeSlackEventReceipt({
         eventId: payload.event_id ?? undefined,
-        status: SlackEventReceiptStatus.SKIPPED,
+        status: SlackEventReceiptStatus.DONE,
         intent,
         ignoredReason: 'integration_not_found',
       }).catch((error) => {
@@ -508,11 +636,11 @@ export async function handleSlackEvent(
         slackUserId: userId,
         intent,
         replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       });
       await finalizeSlackEventReceipt({
         eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent,
         error: replied ? null : 'reply_failed',
       }).catch((error) => {
@@ -545,12 +673,12 @@ export async function handleSlackEvent(
         slackUserId: userId,
         intent: null,
         replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         ignoredReason: 'unrecognized_command',
       });
       await finalizeSlackEventReceipt({
         eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent: null,
         ignoredReason: 'unrecognized_command',
         error: replied ? null : 'reply_failed',
@@ -590,11 +718,11 @@ export async function handleSlackEvent(
         slackUserId: userId,
         intent,
         replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       });
       await finalizeSlackEventReceipt({
         eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent,
         error: replied ? null : 'reply_failed',
       }).catch((error) => {
@@ -656,11 +784,11 @@ export async function handleSlackEvent(
         slackUserId: userId,
         intent,
         replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       });
       await finalizeSlackEventReceipt({
         eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent,
         error: replied ? null : 'reply_failed',
       }).catch((error) => {
@@ -695,12 +823,12 @@ export async function handleSlackEvent(
           slackUserId: userId,
           intent,
           replyStatus: replied ? 'sent' : 'failed',
-          receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+          receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
           ignoredReason: 'missing_image',
         });
         await finalizeSlackEventReceipt({
           eventId: payload.event_id ?? undefined,
-          status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+          status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
           intent,
           ignoredReason: 'missing_image',
           error: replied ? null : 'reply_failed',
@@ -736,12 +864,12 @@ export async function handleSlackEvent(
         slackUserId: userId,
         intent,
         replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         ignoredReason: 'registration_required',
       });
       await finalizeSlackEventReceipt({
         eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent,
         ignoredReason: 'registration_required',
         error: replied ? null : 'reply_failed',
@@ -788,14 +916,14 @@ export async function handleSlackEvent(
       channelId,
       slackUserId: userId,
       intent,
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       replyStatus: replied ? 'sent' : 'failed',
       ignoredReason: registrationState.isRegistered ? null : 'registration_required',
     });
 
     await finalizeSlackEventReceipt({
       eventId: payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent,
       error: replied ? null : 'reply_failed',
     }).catch((error) => {
@@ -846,12 +974,12 @@ export async function handleSlackEvent(
       channelId,
       slackUserId: userId,
       intent,
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       replyStatus: replied ? 'sent' : 'failed',
     });
     await finalizeSlackEventReceipt({
       eventId: payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent,
       error: replied ? null : 'reply_failed',
     }).catch((error) => {
@@ -928,7 +1056,7 @@ export async function handleSlackEvent(
       channelId,
       slackUserId: userId,
       intent,
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       replyStatus: replied ? 'sent' : 'failed',
       ignoredReason:
         imageSelection.hasUnsupportedFiles || imageSelection.hasMultipleSupportedFiles
@@ -937,7 +1065,7 @@ export async function handleSlackEvent(
     });
     await finalizeSlackEventReceipt({
       eventId: payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent,
       ignoredReason:
         imageSelection.hasUnsupportedFiles || imageSelection.hasMultipleSupportedFiles
@@ -959,86 +1087,30 @@ export async function handleSlackEvent(
   }
 
   const sourceMessageId = event.client_msg_id ?? event.ts ?? `${Date.now()}`;
-  let photo: Awaited<ReturnType<typeof storeSlackPhotoToBlob>>;
-  try {
-    photo = await storeSlackPhotoToBlob({
-      slackFileUrl,
-      botToken: token,
-      workspaceId,
-      channelId,
-      sourceMessageId,
-      mimeType: selectedFile?.mimetype,
-      fileId: selectedFile?.id ?? null,
-      fileSize: selectedFile?.size ?? null,
-      context: {
-        ...context,
-        workspaceId,
-        channelId,
-        groupId: integration.groupId,
-        goalId: integration.goalId,
-        slackUserId: userId,
-      },
-    });
-  } catch (error) {
-    logEvent('warn', 'slack.asset_upload_fallback', {
-      eventType: 'slack_checkin',
-      ...context,
-      workspaceId,
-      channelId,
-      groupId: integration.groupId,
-      goalId: integration.goalId,
-      slackUserId: userId,
-      reason: error instanceof Error ? error.message : String(error),
-      fallback: true,
-      file: maskSlackFileUrl(slackFileUrl),
-    });
-    photo = {
-      blobUrl: slackFileUrl,
-      slackOriginalUrl: slackFileUrl,
-      mimeType: selectedFile?.mimetype,
-      uploadFailed: true,
-    };
-  }
+  const photoPlaceholder = slackFileUrl
+    ? {
+        blobUrl: null,
+        slackOriginalUrl: slackFileUrl,
+        mimeType: selectedFile?.mimetype,
+        uploadFailed: false,
+      }
+    : undefined;
 
   const targetUserId = intent === 'admin_checkin' ? mentionedUserId : userId;
   let targetDisplayName = registrationState.user.displayName;
   if (intent === 'admin_checkin') {
     if (!targetUserId) {
-      const replied = await sendSlackMessage({
-        token,
-        channelId,
-        threadTs: event.ts,
-        text: `<@${userId}> 대신 인증할 사용자를 멘션해주세요`,
-      });
-      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
-        eventType: 'slack_checkin',
-        ...context,
+      return queueSlackReply({
+        payload,
+        context,
         workspaceId,
         channelId,
         slackUserId: userId,
         intent,
-        replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-        ignoredReason: 'missing_target_user',
+        text: `<@${userId}> 대신 인증할 사용자를 멘션해주세요`,
+        receiptEventId: payload.event_id ?? undefined,
+        token: process.env.SLACK_BOT_TOKEN ?? undefined,
       });
-      await finalizeSlackEventReceipt({
-        eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-        intent,
-        ignoredReason: 'missing_target_user',
-        error: replied ? null : 'reply_failed',
-      }).catch((error) => {
-        logEvent('warn', 'slack.event_receipt_finalize_failed', {
-          eventType: 'slack_checkin',
-          ...context,
-          workspaceId,
-          channelId,
-          slackUserId: userId,
-          intent,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      });
-      return { ok: true, ignored: true };
     }
 
     const targetRegistrationState = await getSlackRegistrationState({
@@ -1048,41 +1120,17 @@ export async function handleSlackEvent(
       groupId: integration.groupId,
     });
     if (!targetRegistrationState.isRegistered || !targetRegistrationState.user) {
-      const replied = await sendSlackMessage({
-        token,
-        channelId,
-        threadTs: event.ts,
-        text: `<@${targetUserId}>님은 아직 등록되지 않았어요. 먼저 \`${mention} 닉네임 설정 이름\`으로 등록해주세요.`,
-      });
-      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
-        eventType: 'slack_checkin',
-        ...context,
+      return queueSlackReply({
+        payload,
+        context,
         workspaceId,
         channelId,
         slackUserId: userId,
         intent,
-        replyStatus: replied ? 'sent' : 'failed',
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-        ignoredReason: 'target_registration_required',
+        text: `<@${targetUserId}>님은 아직 등록되지 않았어요. 먼저 \`${mention} 닉네임 설정 이름\`으로 등록해주세요.`,
+        receiptEventId: payload.event_id ?? undefined,
+        token: process.env.SLACK_BOT_TOKEN ?? undefined,
       });
-      await finalizeSlackEventReceipt({
-        eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-        intent,
-        ignoredReason: 'target_registration_required',
-        error: replied ? null : 'reply_failed',
-      }).catch((error) => {
-        logEvent('warn', 'slack.event_receipt_finalize_failed', {
-          eventType: 'slack_checkin',
-          ...context,
-          workspaceId,
-          channelId,
-          slackUserId: userId,
-          intent,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      });
-      return { ok: true, ignored: true };
     }
     targetDisplayName = targetRegistrationState.user.displayName;
 
@@ -1093,41 +1141,17 @@ export async function handleSlackEvent(
       groupId: integration.groupId,
     });
     if (!adminValidation.ok) {
-      const replied = await sendSlackMessage({
-        token,
-        channelId,
-        threadTs: event.ts,
-        text: adminValidation.message,
-      });
-      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
-        eventType: 'slack_checkin',
-        ...context,
+      return queueSlackReply({
+        payload,
+        context,
         workspaceId,
         channelId,
         slackUserId: userId,
         intent,
-        receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-        replyStatus: replied ? 'sent' : 'failed',
-        ignoredReason: 'admin_validation_failed',
+        text: adminValidation.message,
+        receiptEventId: payload.event_id ?? undefined,
+        token: process.env.SLACK_BOT_TOKEN ?? undefined,
       });
-      await finalizeSlackEventReceipt({
-        eventId: payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-        intent,
-        ignoredReason: 'admin_validation_failed',
-        error: replied ? null : 'reply_failed',
-      }).catch((error) => {
-        logEvent('warn', 'slack.event_receipt_finalize_failed', {
-          eventType: 'slack_checkin',
-          ...context,
-          workspaceId,
-          channelId,
-          slackUserId: userId,
-          intent,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      });
-      return { ok: true, ignored: true };
     }
   }
 
@@ -1138,7 +1162,7 @@ export async function handleSlackEvent(
       workspaceId,
       channelId,
       sourceMessageId,
-      photo,
+      photo: photoPlaceholder,
       note: event.text,
       checkedAt: toSlackTimestampDate(event.ts),
       allowChangeCandidateOnDuplicate: intent !== 'admin_checkin',
@@ -1163,28 +1187,9 @@ export async function handleSlackEvent(
         groupId: integration.groupId,
         goalId: integration.goalId,
         slackUserId: targetUserId ?? userId,
-      });
-    }
-
-    let currentStatusForAccepted: Awaited<ReturnType<typeof getCurrentStatus>> | null = null;
-    if (result.status === 'accepted') {
-      currentStatusForAccepted = await getCurrentStatus({
-        workspaceId,
-        channelId,
-        externalSlackId: targetUserId ?? userId,
-      }).catch((error) => {
-        logEvent('warn', 'slack.current_status_load_failed', {
-          eventType: 'slack_checkin',
-          ...context,
-          workspaceId,
-          channelId,
-          groupId: integration.groupId,
-          goalId: integration.goalId,
-          slackUserId: targetUserId ?? userId,
-          reason: error instanceof Error ? error.message : String(error),
-          stage: 'accepted_reply',
-        });
-        return null;
+        checkInRecordId: result.checkInId,
+        rawSubmissionId: result.rawSubmissionId,
+        submissionAssetId: result.submissionAssetId,
       });
     }
 
@@ -1200,77 +1205,68 @@ export async function handleSlackEvent(
         goalId: integration.goalId,
         slackUserId: targetUserId ?? userId,
         candidateSaved: result.candidateSaved,
-        candidateId: result.candidateId ?? null,
+        candidateId: result.candidateId ?? undefined,
       });
     }
 
-    const replied = await replyForCheckInResult({
-      token,
-      workspaceId,
-      channelId,
-      threadTs: event.ts,
-      actorUserId: userId,
-      targetUserId: targetUserId ?? userId,
-      displayName: targetDisplayName,
-      mention,
-      goalInfo,
-      result,
-      isAdminCheckIn: intent === 'admin_checkin',
-      currentStatus: currentStatusForAccepted ?? undefined,
-    });
-
-    if (result.status === 'accepted' && currentStatusForAccepted) {
-      const channelUpdateText = buildChannelStatusText(currentStatusForAccepted);
-      const channelUpdateSent = await sendSlackMessage({
-        token,
-        channelId,
-        text: channelUpdateText,
+    if (payload.event_id) {
+      await finalizeSlackEventReceipt({
+        eventId: payload.event_id,
+        status: SlackEventReceiptStatus.DONE,
+        intent,
+        processedAt: new Date(),
+      }).catch((error) => {
+        logEvent('warn', 'slack.event_receipt_finalize_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          groupId: integration.groupId,
+          goalId: integration.goalId,
+          slackUserId: targetUserId ?? userId,
+          intent,
+          reason: error instanceof Error ? error.message : String(error),
+        });
       });
-      logEvent(channelUpdateSent ? 'info' : 'warn', channelUpdateSent ? 'slack.channel_update_sent' : 'slack.channel_update_failed', {
-        eventType: 'slack_checkin',
-        ...context,
+    }
+
+    after(() => {
+      void processSlackCheckInAfterAck({
+        payload,
+        context,
         workspaceId,
         channelId,
         groupId: integration.groupId,
         goalId: integration.goalId,
-        slackUserId: targetUserId ?? userId,
-        intent,
-        replyStatus: channelUpdateSent ? 'sent' : 'failed',
-      });
-    }
-
-    logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
-      eventType: 'slack_checkin',
-      ...context,
-      workspaceId,
-      channelId,
-      groupId: integration.groupId,
-      goalId: integration.goalId,
-      slackUserId: targetUserId ?? userId,
-      intent,
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-      replyStatus: replied ? 'sent' : 'failed',
-    });
-    await finalizeSlackEventReceipt({
-      eventId: payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
-      intent,
-      error: replied ? null : 'reply_failed',
-    }).catch((error) => {
-      logEvent('warn', 'slack.event_receipt_finalize_failed', {
-        eventType: 'slack_checkin',
-        ...context,
-        workspaceId,
-        channelId,
-        groupId: integration.groupId,
-        goalId: integration.goalId,
-        slackUserId: targetUserId ?? userId,
-        intent,
-        reason: error instanceof Error ? error.message : String(error),
+        botUserId,
+        token: process.env.SLACK_BOT_TOKEN ?? integration.botToken ?? undefined,
+        mention,
+        goalInfo,
+        intent: intent as 'checkin' | 'admin_checkin',
+        result,
+        sourceMessageId,
+        selectedFile,
+        slackFileUrl,
+        targetUserId: targetUserId ?? userId,
+        targetDisplayName,
+        actorUserId: userId,
+        threadTs: event.ts,
+      }).catch((error) => {
+        logEvent('error', 'slack.event_failed', {
+          eventType: 'slack_checkin',
+          ...context,
+          workspaceId,
+          channelId,
+          groupId: integration.groupId,
+          goalId: integration.goalId,
+          slackUserId: targetUserId ?? userId,
+          sourceMessageId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
       });
     });
 
-    return { ok: true, ...result };
+    return { ok: true, acknowledged: true, status: result.status };
   } catch (error) {
     logEvent('error', 'slack.checkin_db_write_failed', {
       type: 'checkin',
@@ -1290,6 +1286,7 @@ export async function handleSlackEvent(
       status: SlackEventReceiptStatus.FAILED,
       intent,
       error: error instanceof Error ? error.message : String(error),
+      processedAt: new Date(),
     }).catch((finalizeError) => {
       logEvent('warn', 'slack.event_receipt_finalize_failed', {
         eventType: 'slack_checkin',
@@ -1444,6 +1441,272 @@ async function replyForChangeResult(input: {
   });
 }
 
+async function queueSlackReply(input: {
+  payload: Record<string, any>;
+  context: LogContext;
+  workspaceId: string;
+  channelId: string;
+  slackUserId: string;
+  intent: SlackIntent;
+  text: string;
+  receiptEventId?: string;
+  token?: string;
+}) {
+  if (input.receiptEventId) {
+    await finalizeSlackEventReceipt({
+      eventId: input.receiptEventId,
+      status: SlackEventReceiptStatus.DONE,
+      intent: input.intent,
+      processedAt: new Date(),
+    }).catch((error) => {
+      logEvent('warn', 'slack.event_receipt_finalize_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.slackUserId,
+        intent: input.intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  after(() => {
+    void (async () => {
+      const replied = await sendSlackMessage({
+        token: input.token,
+        channelId: input.channelId,
+        text: input.text,
+        threadTs: input.payload.event?.ts,
+      });
+
+      logEvent(replied ? 'info' : 'warn', replied ? 'slack.reply_sent' : 'slack.reply_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.slackUserId,
+        intent: input.intent,
+        replyStatus: replied ? 'sent' : 'failed',
+        receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
+      });
+
+      logEvent(replied ? 'info' : 'warn', replied ? 'slack.event_done' : 'slack.event_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.slackUserId,
+        intent: input.intent,
+        reason: replied ? null : 'reply_failed',
+      });
+    })().catch((error) => {
+      logEvent('error', 'slack.event_failed', {
+        eventType: 'slack_checkin',
+        ...input.context,
+        workspaceId: input.workspaceId,
+        channelId: input.channelId,
+        slackUserId: input.slackUserId,
+        intent: input.intent,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  return { ok: true, acknowledged: true };
+}
+
+async function processSlackCheckInAfterAck(input: {
+  payload: Record<string, any>;
+  context: LogContext;
+  workspaceId: string;
+  channelId: string;
+  groupId: string;
+  goalId: string;
+  botUserId: string;
+  token?: string;
+  mention: string;
+  goalInfo: {
+    goalTitle: string;
+    targetCount: number;
+    penaltyText?: string;
+  };
+  intent: 'checkin' | 'admin_checkin';
+  result: Awaited<ReturnType<typeof createFromSlackMessage>>;
+  sourceMessageId: string;
+  selectedFile?: SlackEventFile | null;
+  slackFileUrl?: string;
+  targetUserId: string;
+  targetDisplayName: string;
+  actorUserId: string;
+  threadTs?: string;
+}) {
+  const commonContext = {
+    ...input.context,
+    workspaceId: input.workspaceId,
+    channelId: input.channelId,
+    groupId: input.groupId,
+    goalId: input.goalId,
+    slackUserId: input.targetUserId,
+    checkInRecordId: input.result.status === 'accepted' ? input.result.checkInId : undefined,
+    rawSubmissionId: input.result.status === 'accepted' ? input.result.rawSubmissionId : undefined,
+    submissionAssetId: input.result.status === 'accepted' ? input.result.submissionAssetId : undefined,
+    candidateId: input.result.status === 'duplicate' ? input.result.candidateId : undefined,
+    sourceMessageId: input.sourceMessageId,
+  };
+
+  let hadFailure = false;
+  const acceptedResult =
+    input.result.status === 'accepted'
+      ? (input.result as Extract<typeof input.result, { status: 'accepted' }>)
+      : null;
+  const duplicateResult =
+    input.result.status === 'duplicate'
+      ? (input.result as Extract<typeof input.result, { status: 'duplicate' }>)
+      : null;
+
+  const currentStatus =
+    acceptedResult
+      ? await getCurrentStatus({
+          workspaceId: input.workspaceId,
+          channelId: input.channelId,
+          externalSlackId: input.targetUserId,
+        }).catch((error) => {
+          hadFailure = true;
+          logEvent('warn', 'slack.current_status_load_failed', {
+            eventType: 'slack_checkin',
+            ...commonContext,
+            reason: error instanceof Error ? error.message : String(error),
+            stage: 'accepted_reply',
+          });
+          return null;
+        })
+      : undefined;
+
+  const reply = await replyForCheckInResult({
+    token: input.token,
+    workspaceId: input.workspaceId,
+    channelId: input.channelId,
+    threadTs: input.threadTs,
+    actorUserId: input.actorUserId,
+    targetUserId: input.targetUserId,
+    displayName: input.targetDisplayName,
+    mention: input.mention,
+    goalInfo: input.goalInfo,
+    result: input.result,
+    isAdminCheckIn: input.intent === 'admin_checkin',
+    currentStatus: currentStatus ?? undefined,
+  });
+
+  logEvent(reply ? 'info' : 'warn', reply ? 'slack.reply_sent' : 'slack.reply_failed', {
+    eventType: 'slack_checkin',
+    ...commonContext,
+    replyStatus: reply ? 'sent' : 'failed',
+  });
+
+  if (!reply) {
+    hadFailure = true;
+  }
+
+  if (acceptedResult && currentStatus) {
+    const channelUpdateSent = await sendSlackMessage({
+      token: input.token,
+      channelId: input.channelId,
+      text: buildChannelStatusText(currentStatus),
+    });
+    logEvent(channelUpdateSent ? 'info' : 'warn', channelUpdateSent ? 'slack.channel_status_sent' : 'slack.channel_status_failed', {
+      eventType: 'slack_checkin',
+      ...commonContext,
+      replyStatus: channelUpdateSent ? 'sent' : 'failed',
+    });
+    if (!channelUpdateSent) {
+      hadFailure = true;
+    }
+  }
+
+  if (input.slackFileUrl && (acceptedResult || duplicateResult)) {
+    const photo = await storeSlackPhotoToBlob({
+      slackFileUrl: input.slackFileUrl,
+      botToken: input.token,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      sourceMessageId: input.sourceMessageId,
+      mimeType: input.selectedFile?.mimetype,
+      fileId: input.selectedFile?.id ?? null,
+      fileSize: input.selectedFile?.size ?? null,
+      context: {
+        ...commonContext,
+        slackUserId: input.targetUserId,
+      },
+    });
+
+    if (acceptedResult && acceptedResult.rawSubmissionId) {
+      await updateSlackSubmissionAsset({
+        rawSubmissionId: acceptedResult.rawSubmissionId,
+        blobUrl: photo.blobUrl,
+        storageKey: photo.storageKey,
+        uploadFailed: photo.uploadFailed,
+        mimeType: photo.mimeType ?? input.selectedFile?.mimetype ?? null,
+        slackOriginalUrl: photo.slackOriginalUrl,
+      }).catch((error) => {
+        hadFailure = true;
+        logEvent('warn', 'slack.asset_upload_failed', {
+          eventType: 'slack_checkin',
+          ...commonContext,
+          checkInRecordId: acceptedResult.checkInId,
+          rawSubmissionId: acceptedResult.rawSubmissionId,
+          submissionAssetId: acceptedResult.submissionAssetId,
+          reason: error instanceof Error ? error.message : String(error),
+          assetStatus: 'update_failed',
+        });
+      });
+    }
+
+    if (duplicateResult && duplicateResult.candidateSaved && duplicateResult.candidateId) {
+      await updateSlackChangeCandidateAsset({
+        candidateId: duplicateResult.candidateId,
+        blobUrl: photo.blobUrl,
+        uploadFailed: photo.uploadFailed,
+        mimeType: photo.mimeType ?? input.selectedFile?.mimetype ?? null,
+        slackOriginalUrl: photo.slackOriginalUrl,
+      }).catch((error) => {
+        hadFailure = true;
+        logEvent('warn', 'slack.asset_upload_failed', {
+          eventType: 'slack_checkin',
+          ...commonContext,
+          candidateId: duplicateResult.candidateId,
+          reason: error instanceof Error ? error.message : String(error),
+          assetStatus: 'update_failed',
+        });
+      });
+    }
+
+    logEvent('info', 'slack.asset_upload_applied', {
+      eventType: 'slack_checkin',
+      ...commonContext,
+      assetStatus: photo.blobUrl ? 'success' : 'failed',
+    });
+
+    if (!photo.blobUrl) {
+      hadFailure = true;
+    }
+  }
+
+  if (hadFailure) {
+    logEvent('warn', 'slack.event_failed', {
+      eventType: 'slack_checkin',
+      ...commonContext,
+      reason: 'post_ack_failure',
+    });
+    return;
+  }
+
+  logEvent('info', 'slack.event_done', {
+    eventType: 'slack_checkin',
+    ...commonContext,
+  });
+}
+
 async function findSlackIntegration(workspaceId?: string, channelId?: string) {
   if (!workspaceId || !channelId) {
     return null;
@@ -1573,12 +1836,12 @@ async function handleAdminSettingsDm(input: {
       slackUserId: input.userId,
       intent: input.intent,
       replyStatus: replied ? 'sent' : 'failed',
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       ignoredReason: resolved.reason,
     });
     await finalizeSlackEventReceipt({
       eventId: input.payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent: input.intent,
       ignoredReason: resolved.reason,
       error: replied ? null : 'reply_failed',
@@ -1624,11 +1887,11 @@ async function handleAdminSettingsDm(input: {
       slackUserId: input.userId,
       intent: input.intent,
       replyStatus: replied ? 'sent' : 'failed',
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
     });
     await finalizeSlackEventReceipt({
       eventId: input.payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent: input.intent,
       error: replied ? null : 'reply_failed',
     }).catch((error) => {
@@ -1655,7 +1918,7 @@ async function handleAdminSettingsDm(input: {
       });
       await finalizeSlackEventReceipt({
         eventId: input.payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent: input.intent,
         error: replied ? null : 'reply_failed',
       }).catch((error) => {
@@ -1686,7 +1949,7 @@ async function handleAdminSettingsDm(input: {
       });
       await finalizeSlackEventReceipt({
         eventId: input.payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent: input.intent,
         error: replied ? null : 'reply_failed',
       }).catch((error) => {
@@ -1723,11 +1986,11 @@ async function handleAdminSettingsDm(input: {
       slackUserId: input.userId,
       intent: input.intent,
       replyStatus: replied ? 'sent' : 'failed',
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
     });
     await finalizeSlackEventReceipt({
       eventId: input.payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent: input.intent,
       error: replied ? null : 'reply_failed',
     }).catch((error) => {
@@ -1754,7 +2017,7 @@ async function handleAdminSettingsDm(input: {
       });
       await finalizeSlackEventReceipt({
         eventId: input.payload.event_id ?? undefined,
-        status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+        status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
         intent: input.intent,
         error: replied ? null : 'reply_failed',
       }).catch((error) => {
@@ -1797,11 +2060,11 @@ async function handleAdminSettingsDm(input: {
       slackUserId: input.userId,
       intent: input.intent,
       replyStatus: replied ? 'sent' : 'failed',
-      receiptStatus: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      receiptStatus: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
     });
     await finalizeSlackEventReceipt({
       eventId: input.payload.event_id ?? undefined,
-      status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+      status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
       intent: input.intent,
       error: replied ? null : 'reply_failed',
     }).catch((error) => {
@@ -1825,7 +2088,7 @@ async function handleAdminSettingsDm(input: {
   });
   await finalizeSlackEventReceipt({
     eventId: input.payload.event_id ?? undefined,
-    status: replied ? SlackEventReceiptStatus.COMPLETED : SlackEventReceiptStatus.FAILED,
+    status: replied ? SlackEventReceiptStatus.DONE : SlackEventReceiptStatus.FAILED,
     intent: input.intent,
     error: replied ? null : 'reply_failed',
   }).catch((error) => {

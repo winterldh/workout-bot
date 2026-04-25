@@ -2,7 +2,7 @@ import { put } from '@vercel/blob';
 import { logEvent, maskSlackFileUrl, type LogContext } from '@/lib/observability/logger';
 
 export interface StoredSlackPhoto {
-  blobUrl: string;
+  blobUrl: string | null;
   slackOriginalUrl: string;
   mimeType?: string;
   storageKey?: string;
@@ -173,7 +173,7 @@ function fallbackStoredPhoto(
   reason?: string,
 ): StoredSlackPhoto {
   return {
-    blobUrl: input.slackFileUrl,
+    blobUrl: null,
     slackOriginalUrl: input.slackFileUrl,
     mimeType: input.mimeType,
     uploadFailed,

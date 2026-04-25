@@ -32,6 +32,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ ok: true, ignored: true });
     }
 
+    logEvent('info', 'slack.event_received', {
+      eventType: 'slack_event',
+      requestId,
+      eventId: payload.event_id ?? null,
+      retryNum,
+      retryReason,
+      payloadType: payload.type ?? null,
+    });
+
     if (payload.type === 'url_verification') {
       logEvent('info', 'slack.url_verification', {
         eventType: 'slack_event',

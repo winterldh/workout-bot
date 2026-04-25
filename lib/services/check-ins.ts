@@ -13,6 +13,14 @@ import {
 import { logEvent } from '@/lib/observability/logger';
 import { getSlackRegistrationState } from '@/lib/services/users';
 
+type SlackCheckInPhotoInput = {
+  blobUrl?: string | null;
+  slackOriginalUrl?: string | null;
+  mimeType?: string;
+  storageKey?: string;
+  uploadFailed?: boolean;
+};
+
 export async function createFromSlackMessage(input: {
   externalSlackId: string;
   displayName: string;
@@ -20,13 +28,7 @@ export async function createFromSlackMessage(input: {
   workspaceId: string;
   channelId: string;
   sourceMessageId: string;
-  photo?: {
-    blobUrl: string;
-    slackOriginalUrl: string;
-    mimeType?: string;
-    storageKey?: string;
-    uploadFailed?: boolean;
-  };
+  photo?: SlackCheckInPhotoInput;
   note?: string;
   checkedAt: Date;
   allowChangeCandidateOnDuplicate?: boolean;
@@ -142,6 +144,8 @@ export async function createFromSlackMessage(input: {
       let candidateSaved = false;
 
       if (input.photo && input.allowChangeCandidateOnDuplicate !== false) {
+        const candidateBlobUrl = input.photo.blobUrl ?? input.photo.slackOriginalUrl ?? null;
+        const candidateOriginalUrl = input.photo.slackOriginalUrl ?? candidateBlobUrl;
         const candidate = await tx.slackChangeCandidate.upsert({
           where: {
             workspaceId_channelId_userId_recordDate: {
@@ -159,19 +163,19 @@ export async function createFromSlackMessage(input: {
             channelId: input.channelId,
             recordDate: normalizedRecordDate,
             sourceMessageId: input.sourceMessageId,
-            imageUrl: input.photo.blobUrl,
-            blobUrl: input.photo.blobUrl,
-            originalPhotoUrl: input.photo.slackOriginalUrl,
-            slackOriginalUrl: input.photo.slackOriginalUrl,
+            imageUrl: candidateBlobUrl ?? '',
+            blobUrl: candidateBlobUrl,
+            originalPhotoUrl: candidateOriginalUrl,
+            slackOriginalUrl: candidateOriginalUrl,
             submittedAt: input.checkedAt,
             note: input.note,
           },
           update: {
             sourceMessageId: input.sourceMessageId,
-            imageUrl: input.photo.blobUrl,
-            blobUrl: input.photo.blobUrl,
-            originalPhotoUrl: input.photo.slackOriginalUrl,
-            slackOriginalUrl: input.photo.slackOriginalUrl,
+            imageUrl: candidateBlobUrl ?? '',
+            blobUrl: candidateBlobUrl,
+            originalPhotoUrl: candidateOriginalUrl,
+            slackOriginalUrl: candidateOriginalUrl,
             submittedAt: input.checkedAt,
             note: input.note,
           },
@@ -200,6 +204,9 @@ export async function createFromSlackMessage(input: {
       };
     }
 
+    const submissionBlobUrl = input.photo?.blobUrl ?? input.photo?.slackOriginalUrl ?? null;
+    const submissionOriginalUrl = input.photo?.slackOriginalUrl ?? submissionBlobUrl;
+
     const rawSubmission = await tx.rawSubmission.create({
       data: {
         groupId: integration.groupId,
@@ -213,26 +220,40 @@ export async function createFromSlackMessage(input: {
         rawPayload: {
           workspaceId: input.workspaceId,
           channelId: input.channelId,
+          sourceMessageId: input.sourceMessageId,
+          photo: input.photo
+            ? {
+                blobUrl: input.photo.blobUrl ?? null,
+                slackOriginalUrl: input.photo.slackOriginalUrl ?? null,
+                mimeType: input.photo.mimeType ?? null,
+                storageKey: input.photo.storageKey ?? null,
+                uploadFailed: Boolean(input.photo.uploadFailed),
+              }
+            : null,
+          assetStatus: input.photo ? (input.photo.uploadFailed ? 'failed' : 'pending') : null,
         },
       },
     });
 
+    let submissionAssetId: string | undefined;
     if (input.photo) {
-      await tx.submissionAsset.create({
+      const submissionAsset = await tx.submissionAsset.create({
         data: {
           rawSubmissionId: rawSubmission.id,
           kind: SubmissionAssetKind.IMAGE,
           mimeType: input.photo.mimeType ?? 'image/jpeg',
-          originalUrl: input.photo.blobUrl,
-          blobUrl: input.photo.blobUrl,
-          originalPhotoUrl: input.photo.slackOriginalUrl,
-          slackOriginalUrl: input.photo.slackOriginalUrl,
+          originalUrl: submissionBlobUrl,
+          blobUrl: input.photo.uploadFailed ? null : input.photo.blobUrl ?? null,
+          originalPhotoUrl: submissionOriginalUrl,
+          slackOriginalUrl: submissionOriginalUrl,
           storageKey: input.photo.storageKey,
           metadata: input.photo.uploadFailed
-            ? { blobUploadFailed: true }
-            : undefined,
+            ? { blobUploadFailed: true, blobStatus: 'failed' }
+            : { blobStatus: input.photo.blobUrl ? 'done' : 'pending' },
         },
+        select: { id: true },
       });
+      submissionAssetId = submissionAsset.id;
     }
 
     const checkIn = await tx.checkInRecord.create({
@@ -262,8 +283,63 @@ export async function createFromSlackMessage(input: {
       userCreated: false,
       membershipCreated: !existingMembership,
       checkInId: checkIn.id,
+      rawSubmissionId: rawSubmission.id,
+      submissionAssetId,
       candidateSaved: false,
     };
+  });
+}
+
+export async function updateSlackSubmissionAsset(input: {
+  rawSubmissionId: string;
+  blobUrl: string | null;
+  storageKey?: string;
+  uploadFailed?: boolean;
+  mimeType?: string | null;
+  slackOriginalUrl?: string | null;
+}) {
+  const updated = await prisma.submissionAsset.updateMany({
+    where: {
+      rawSubmissionId: input.rawSubmissionId,
+    },
+    data: {
+      blobUrl: input.blobUrl,
+      storageKey: input.storageKey ?? undefined,
+      mimeType: input.mimeType ?? undefined,
+      originalUrl: input.blobUrl ?? input.slackOriginalUrl ?? undefined,
+      originalPhotoUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
+      slackOriginalUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
+      metadata: input.uploadFailed
+        ? { blobUploadFailed: true, blobStatus: 'failed' }
+        : input.blobUrl
+          ? { blobStatus: 'done' }
+          : { blobStatus: 'pending' },
+    },
+  });
+
+  return updated;
+}
+
+export async function updateSlackChangeCandidateAsset(input: {
+  candidateId: string;
+  blobUrl: string | null;
+  uploadFailed?: boolean;
+  mimeType?: string | null;
+  slackOriginalUrl?: string | null;
+}) {
+  return prisma.slackChangeCandidate.update({
+    where: {
+      id: input.candidateId,
+    },
+    data: {
+      blobUrl: input.blobUrl,
+      imageUrl: input.blobUrl ?? input.slackOriginalUrl ?? '',
+      originalPhotoUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
+      slackOriginalUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
+    },
+    select: {
+      id: true,
+    },
   });
 }
 

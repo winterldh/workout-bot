@@ -5,15 +5,22 @@ export interface LogContext {
   eventId?: string;
   retryNum?: string | null;
   retryReason?: string | null;
+  receiptId?: string;
   workspaceId?: string;
   channelId?: string;
   groupId?: string;
   goalId?: string;
   slackUserId?: string;
+  checkInRecordId?: string;
+  rawSubmissionId?: string;
+  submissionAssetId?: string;
+  candidateId?: string;
   intent?: string | null;
   ignoredReason?: string | null;
   replyStatus?: string | null;
   receiptStatus?: string | null;
+  assetStatus?: string | null;
+  sourceMessageId?: string | null;
 }
 
 export function logEvent(

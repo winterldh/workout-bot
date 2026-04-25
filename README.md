@@ -130,13 +130,14 @@ npm run prisma:seed
   - `패널티 설정 N원`: `GroupSetting.weeklyPenaltyText`를 저장합니다.
   - `설정 확인`: 현재 목표와 패널티를 확인합니다.
 - Slack 이미지는 `SLACK_BOT_TOKEN`으로 다운로드한 뒤 Vercel Blob에 업로드하고, DB에는 `blobUrl`에 저장합니다.
-- Slack 원본 파일 URL은 `slackOriginalUrl`에 보관합니다. 기존 `originalUrl`, `originalPhotoUrl`, `imageUrl`은 호환용 legacy 필드입니다.
+- Slack 원본 파일 URL은 `slackOriginalUrl`에 보관합니다. Blob 업로드가 실패하면 `blobUrl`은 `null`로 남고 원본 URL만 유지합니다.
+- 기존 `originalUrl`, `originalPhotoUrl`, `imageUrl`은 호환용 legacy 필드입니다.
 - 동일 `goalId + userId + recordDate` 중복: SlackChangeCandidate를 upsert합니다.
 
 ### 업로드 실패 fallback
 
 - Slack 파일 다운로드나 Blob 업로드가 실패하면 로그를 남기고 Slack 원본 URL로 fallback 저장합니다.
-- 이 경우 `SubmissionAsset.blobUrl`과 `SubmissionAsset.originalUrl`은 Slack URL이 될 수 있습니다.
+- 이 경우 `SubmissionAsset.blobUrl`은 `null`일 수 있고, `SubmissionAsset.originalUrl`과 `slackOriginalUrl`만 유지됩니다.
 - 장애 추적은 `slack.asset_upload_fallback`, `slack.asset_upload_success`, `slack.image_selection_ignored`, `slack.checkin_duplicate` 로그를 먼저 확인합니다.
 - 이벤트 ACK는 signature 검증과 최소 파싱 후 즉시 응답하고, 실제 체크인은 백그라운드 처리 로그로 추적합니다.
 
@@ -156,7 +157,7 @@ npm run prisma:seed
 - `<@BOT_USER_ID> 변경` + 이미지: 변경 요청 스레드 안내
 - `<@BOT_USER_ID> 현황`: 전체 현황 스레드 안내
 - 멘션 없이 인증/사진만: 무시
-- retry 이벤트: `SlackEventReceipt` 기준 중복 없음
+- retry 이벤트: `SlackEventReceipt`의 `DONE` 상태는 duplicate skip, `PROCESSING`은 stale 기준으로만 재처리
 - bot message / thread reply / message_changed / message_deleted: 무시
 - Blob 업로드 실패: Slack URL fallback 저장 및 `slack.asset_upload_fallback` 로그 확인
 
@@ -169,6 +170,7 @@ npm run prisma:seed
 - 이상 시 `requestId` / `eventId` 기준으로 `slack.*` JSON 로그를 따라가면 됩니다.
 - Blob 업로드 실패가 반복되면 Slack 토큰 권한과 Vercel Blob 토큰을 우선 점검합니다.
 - weekly report는 `WeeklyReportRun` 테이블의 `runKey`로 중복 실행을 막고, 30분 이상 오래된 RUNNING 상태만 재시도합니다.
+- Slack Events는 `SlackEventReceipt`의 `PROCESSING / DONE / FAILED` 상태와 2분 stale 기준으로 중복과 재처리를 다룹니다.
 - 설정 관련 변경이 있으면 `npm run prisma:generate`와 `npx prisma migrate deploy`가 먼저 통과해야 배포 완료로 봅니다.
 
 ### Slack 연동 URL
