@@ -395,36 +395,33 @@ async function main() {
         {
           label: 'db.unique.SlackEventReceipt.workspaceId_eventId',
           table: 'SlackEventReceipt',
-          snippet: 'UNIQUE ("workspaceId", "eventId")',
+          snippet: '("workspaceId", "eventId")',
         },
         {
           label: 'db.unique.SlackEventJob.workspaceId_eventId',
           table: 'SlackEventJob',
-          snippet: 'UNIQUE ("workspaceId", "eventId")',
+          snippet: '("workspaceId", "eventId")',
         },
         {
           label: 'db.unique.CheckInRecord.goalId_userId_recordDate',
           table: 'CheckInRecord',
-          snippet: 'UNIQUE ("goalId", "userId", "recordDate")',
+          snippet: '("goalId", "userId", "recordDate")',
         },
         {
           label: 'db.unique.SlackIntegration.workspaceId_channelId',
           table: 'SlackIntegration',
-          snippet: 'UNIQUE ("workspaceId", "channelId")',
+          snippet: '("workspaceId", "channelId")',
         },
       ] as const;
 
       for (const check of uniqueChecks) {
-        const rows = await prisma.$queryRawUnsafe<{ def: string | null }[]>(
-          `select pg_get_constraintdef(c.oid) as def
-           from pg_constraint c
-           join pg_class t on t.oid = c.conrelid
-           join pg_namespace n on n.oid = t.relnamespace
-           where n.nspname = 'public'
-             and t.relname = '${check.table}'
-             and c.contype = 'u'`,
+        const rows = await prisma.$queryRawUnsafe<{ indexname: string; indexdef: string }[]>(
+          `select indexname, indexdef
+           from pg_indexes
+           where schemaname = 'public'
+             and lower(tablename) = lower('${check.table}')`,
         );
-        if (rows.some((row) => row.def?.includes(check.snippet))) {
+        if (rows.some((row) => row.indexdef.includes('UNIQUE') && row.indexdef.includes(check.snippet))) {
           pass(check.label);
         } else {
           fail(check.label, 'missing unique constraint');
@@ -435,17 +432,21 @@ async function main() {
         `select indexname, indexdef
          from pg_indexes
          where schemaname = 'public'
-           and tablename = 'SlackEventJob'`,
+           and lower(tablename) = lower('SlackEventJob')`,
       );
       const hasJobIndex = jobIndexes.some(
         (row) =>
+          row.indexdef.includes('(status, "nextRetryAt", "lockedAt")') ||
           row.indexdef.includes('("status", "nextRetryAt", "lockedAt")') ||
           row.indexdef.includes('"status", "nextRetryAt", "lockedAt"'),
       );
       if (hasJobIndex) {
         pass('db.index.SlackEventJob.status_nextRetryAt_lockedAt');
       } else {
-        fail('db.index.SlackEventJob.status_nextRetryAt_lockedAt', 'missing index');
+        fail(
+          'db.index.SlackEventJob.status_nextRetryAt_lockedAt',
+          jobIndexes.map((row) => `${row.indexname}: ${row.indexdef}`).join(' | ') || 'missing index',
+        );
       }
 
       const slackIntegration = await prisma.slackIntegration.findUnique({
