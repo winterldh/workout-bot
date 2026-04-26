@@ -10,6 +10,15 @@ type Result = {
   detail?: string;
 };
 
+type ParsedDatabaseUrl = {
+  host: string | null;
+  protocol: string | null;
+  pathname: string | null;
+};
+
+let recoveryPrinted = false;
+let expectedMigrationsPrinted = false;
+
 function parseDotEnvFile(filePath: string) {
   if (!fs.existsSync(filePath)) {
     return;
@@ -60,6 +69,63 @@ function hasEnv(name: string) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function parseDatabaseUrl(rawUrl?: string | null): ParsedDatabaseUrl {
+  if (!rawUrl) {
+    return { host: null, protocol: null, pathname: null };
+  }
+
+  try {
+    const parsed = new URL(rawUrl);
+    return {
+      host: parsed.hostname || null,
+      protocol: parsed.protocol || null,
+      pathname: parsed.pathname || null,
+    };
+  } catch {
+    return { host: null, protocol: null, pathname: null };
+  }
+}
+
+function isLocalHost(host: string | null) {
+  if (!host) {
+    return false;
+  }
+
+  return ['localhost', '127.0.0.1', '0.0.0.0', 'host.docker.internal'].includes(host);
+}
+
+function printRecoveryCommands(results: Result[]) {
+  if (recoveryPrinted) {
+    return;
+  }
+  recoveryPrinted = true;
+
+  const commands = [
+    'npx prisma migrate status',
+    'npx prisma migrate deploy',
+    'npx prisma migrate status',
+    'npm run verify:slack-payload',
+    'npm run verify:production-readiness',
+    'npm run build',
+  ];
+
+  pushResult(results, 'FAIL', 'recovery.commands', commands.join(' | '));
+}
+
+function printExpectedSlackJobMigrations(results: Result[]) {
+  if (expectedMigrationsPrinted) {
+    return;
+  }
+  expectedMigrationsPrinted = true;
+
+  pushResult(
+    results,
+    'FAIL',
+    'db.migrations.expected',
+    '20260425020000_add_slack_event_job_queue, 20260425020100_finish_slack_event_job_queue',
+  );
+}
+
 function runCommand(command: string, args: string[]) {
   const result = spawnSync(command, args, {
     encoding: 'utf8',
@@ -83,6 +149,8 @@ async function main() {
   const fail = (label: string, detail?: string) => pushResult(results, 'FAIL', label, detail);
   const warn = (label: string, detail?: string) => pushResult(results, 'WARN', label, detail);
   const pass = (label: string, detail?: string) => pushResult(results, 'PASS', label, detail);
+  const databaseUrl = process.env.DATABASE_URL?.trim() ?? null;
+  const databaseInfo = parseDatabaseUrl(databaseUrl);
 
   const criticalEnv = [
     'DATABASE_URL',
@@ -123,21 +191,50 @@ async function main() {
     pass('env.SLACK_SIGNING_SECRET format');
   }
 
-  const migrationStatus = runCommand('npx', ['prisma', 'migrate', 'status']);
-  const migrationOutput = `${migrationStatus.stdout}\n${migrationStatus.stderr}`.trim();
-  if (migrationStatus.ok && migrationOutput.includes('Database schema is up to date!')) {
-    pass('prisma.migrate.status', 'up to date');
-  } else if (migrationOutput.includes('Following migration have failed')) {
-    fail('prisma.migrate.status', 'failed migration present');
-  } else if (migrationOutput.match(/have not yet been applied|not up to date|reset/iu)) {
-    fail('prisma.migrate.status', 'pending migration present');
+  if (databaseInfo.host) {
+    pass('db.host', databaseInfo.host);
+  } else {
+    fail('db.host', 'unable to parse DATABASE_URL host');
+  }
+
+  if (isLocalHost(databaseInfo.host)) {
+    fail(
+      'db.host',
+      `local host detected (${databaseInfo.host}); this is not the Supabase production database`,
+    );
+    printExpectedSlackJobMigrations(results);
+    printRecoveryCommands(results);
+  }
+
+  const canRunMigrationStatus = hasEnv('DIRECT_URL') && !isLocalHost(databaseInfo.host);
+  if (canRunMigrationStatus) {
+    const migrationStatus = runCommand('npx', ['prisma', 'migrate', 'status']);
+    const migrationOutput = `${migrationStatus.stdout}\n${migrationStatus.stderr}`.trim();
+    if (migrationStatus.ok && migrationOutput.includes('Database schema is up to date!')) {
+      pass('prisma.migrate.status', 'up to date');
+    } else if (migrationOutput.includes('Following migration have failed')) {
+      fail('prisma.migrate.status', 'failed migration present');
+    } else if (migrationOutput.match(/have not yet been applied|not up to date|reset/iu)) {
+      fail('prisma.migrate.status', 'pending migration present');
+      printExpectedSlackJobMigrations(results);
+      printRecoveryCommands(results);
+    } else {
+      fail(
+        'prisma.migrate.status',
+        migrationStatus.error
+          ? migrationStatus.error.message
+          : migrationOutput || `exit ${migrationStatus.status ?? 'unknown'}`,
+      );
+    }
   } else {
     fail(
       'prisma.migrate.status',
-      migrationStatus.error
-        ? migrationStatus.error.message
-        : migrationOutput || `exit ${migrationStatus.status ?? 'unknown'}`,
+        !hasEnv('DIRECT_URL')
+          ? 'DIRECT_URL missing; cannot verify migrations'
+          : `DATABASE_URL host ${databaseInfo.host ?? 'unknown'} is not production`,
     );
+    printExpectedSlackJobMigrations(results);
+    printRecoveryCommands(results);
   }
 
   const repoRoot = process.cwd();
@@ -202,7 +299,7 @@ async function main() {
     fail('slack-event-jobs.raw-sql.enum-casts', 'expected cast syntax not found');
   }
 
-  if (!missingCriticalEnv) {
+  if (!missingCriticalEnv && canRunMigrationStatus) {
     const { PrismaClient } = await import('@prisma/client');
     const prisma = new PrismaClient();
 
@@ -232,6 +329,14 @@ async function main() {
           pass(`db.table.${table}`);
         } else {
           fail(`db.table.${table}`, 'missing');
+          if (table === 'SlackEventJob') {
+            fail(
+              'db.table.SlackEventJob.hint',
+              'missing table; check db.migrations.expected and recovery.commands above',
+            );
+            printExpectedSlackJobMigrations(results);
+            printRecoveryCommands(results);
+          }
         }
       }
 
@@ -412,7 +517,10 @@ async function main() {
       await prisma.$disconnect();
     }
   } else {
-    warn('db.checks.skipped', 'critical env missing');
+    warn(
+      'db.checks.skipped',
+      !canRunMigrationStatus ? 'migration checks skipped because DIRECT_URL missing or host is local' : 'critical env missing',
+    );
   }
 
   for (const result of results) {

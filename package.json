@@ -10,7 +10,8 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
     "verify:slack-payload": "ts-node --project tsconfig.base.json scripts/verify-slack-payload-normalizer.ts",
-    "verify:production-readiness": "ts-node --project tsconfig.base.json scripts/verify-production-readiness.ts"
+    "verify:production-readiness": "ts-node --project tsconfig.base.json scripts/verify-production-readiness.ts",
+    "verify:predeploy": "npm run verify:slack-payload && npm run verify:production-readiness && npm run build"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

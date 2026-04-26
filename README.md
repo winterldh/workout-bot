@@ -74,6 +74,7 @@ POST /api/slack/commands/status
 npm install
 npm run verify:slack-payload
 npm run verify:production-readiness
+npm run verify:predeploy
 npm run prisma:generate
 npm run prisma:deploy
 npm run build
@@ -200,8 +201,10 @@ npm run prisma:seed
 4. `#인증` + 이미지 여러 장으로 첫 번째 지원 이미지만 저장되는지 확인합니다.
 5. `#인증` 텍스트만 입력했을 때 저장 없이 안내 메시지만 오는지 확인합니다.
 6. 중복 인증 시 `SlackChangeCandidate` upsert와 duplicate 응답이 유지되는지 확인합니다.
-7. 배포 전에 `npm run verify:slack-payload`, `npm run verify:production-readiness`, `npm run build`를 순서대로 통과시킵니다.
-8. `prisma/schema.prisma` 또는 `prisma/migrations`를 수정했다면, 운영 DB에 `npx prisma migrate deploy`가 성공하기 전에는 작업을 완료로 보고하지 않습니다.
+7. 배포 전에 `npm run verify:slack-payload`, `npm run verify:production-readiness`, `npm run build`를 통과하고, 가능하면 `npm run verify:predeploy`로 묶어서 확인합니다.
+8. `prisma/schema.prisma` 또는 `prisma/migrations`를 수정한 작업은 운영 DB에서 `npx prisma migrate deploy`가 성공하기 전에는 완료로 보고하지 않습니다.
+9. `verify:production-readiness`가 PASS 하기 전에는 배포 완료로 보지 않습니다.
+10. seed는 명시 요청이 없는 한 운영 DB에서 실행하지 않습니다.
 
 ## TODO / 리스크
 
