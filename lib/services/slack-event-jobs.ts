@@ -251,7 +251,13 @@ export async function scheduleSlackEventJobProcessing(input: { jobId?: string })
   }
 
   after(() => {
-    void processSlackEventJobs({ jobIds: [jobId], limit: 1 });
+    void processSlackEventJobs({ jobIds: [jobId], limit: 1 }).catch((error) => {
+      logEvent('error', 'slack.event_job_processing_failed', {
+        eventType: 'slack_event_job',
+        jobId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    });
   });
 }
 
@@ -306,13 +312,22 @@ export async function processSlackEventJobs(input?: {
 }
 
 export async function processSlackEventJobById(jobId: string) {
-  const job = await claimSlackEventJob({ jobId, includeFailed: true, includeStale: true });
-  if (!job) {
+  try {
+    const job = await claimSlackEventJob({ jobId, includeFailed: true, includeStale: true });
+    if (!job) {
+      return { claimed: false };
+    }
+
+    await processSlackEventJob(job);
+    return { claimed: true };
+  } catch (error) {
+    logEvent('error', 'slack.event_job_processing_failed', {
+      eventType: 'slack_event_job',
+      jobId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
     return { claimed: false };
   }
-
-  await processSlackEventJob(job);
-  return { claimed: true };
 }
 
 export async function reapSlackEventJobs() {
@@ -337,17 +352,19 @@ async function claimSlackEventJob(input: ClaimJobInput): Promise<SlackEventJobRe
     baseWhere.push(Prisma.sql`"eventId" = ${input.eventId}`);
   }
 
-  const statusClauses: Prisma.Sql[] = [Prisma.sql`"status" = ${SlackEventJobStatus.PENDING}`];
+  const statusClauses: Prisma.Sql[] = [
+    Prisma.sql`"status" = ${SlackEventJobStatus.PENDING}::"SlackEventJobStatus"`,
+  ];
 
   if (input.includeFailed ?? true) {
     statusClauses.push(
-      Prisma.sql`("status" = ${SlackEventJobStatus.FAILED} AND ("nextRetryAt" IS NULL OR "nextRetryAt" <= NOW()))`,
+      Prisma.sql`("status" = ${SlackEventJobStatus.FAILED}::"SlackEventJobStatus" AND ("nextRetryAt" IS NULL OR "nextRetryAt" <= NOW()))`,
     );
   }
 
   if (input.includeStale ?? true) {
     statusClauses.push(
-      Prisma.sql`("status" = ${SlackEventJobStatus.PROCESSING} AND ("lockedAt" IS NULL OR "lockedAt" < ${cutoff}))`,
+      Prisma.sql`("status" = ${SlackEventJobStatus.PROCESSING}::"SlackEventJobStatus" AND ("lockedAt" IS NULL OR "lockedAt" < ${cutoff}))`,
     );
   }
 
@@ -367,7 +384,7 @@ async function claimSlackEventJob(input: ClaimJobInput): Promise<SlackEventJobRe
     )
     UPDATE "SlackEventJob" AS job
     SET
-      "status" = ${SlackEventJobStatus.PROCESSING},
+      "status" = ${SlackEventJobStatus.PROCESSING}::"SlackEventJobStatus",
       "lockedAt" = NOW(),
       "processingStartedAt" = COALESCE(job."processingStartedAt", NOW()),
       "attempts" = job."attempts" + 1,
