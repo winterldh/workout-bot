@@ -75,6 +75,7 @@ npm install
 npm run verify:slack-payload
 npm run verify:production-readiness
 npm run verify:predeploy
+npm run retry:slack-job -- --event-id <EVENT_ID>
 npm run prisma:generate
 npm run prisma:deploy
 npm run build
@@ -205,6 +206,7 @@ npm run prisma:seed
 8. `prisma/schema.prisma` 또는 `prisma/migrations`를 수정한 작업은 운영 DB에서 `npx prisma migrate deploy`가 성공하기 전에는 완료로 보고하지 않습니다.
 9. `verify:production-readiness`가 PASS 하기 전에는 배포 완료로 보지 않습니다.
 10. seed는 명시 요청이 없는 한 운영 DB에서 실행하지 않습니다.
+11. stale `SlackEventJob` 수동 복구는 `npm run retry:slack-job -- --event-id <EVENT_ID>`를 사용합니다.
 
 ## TODO / 리스크
 
