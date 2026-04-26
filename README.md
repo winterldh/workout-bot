@@ -84,6 +84,16 @@ vercel deploy
 
 Vercel Cron은 `vercel.json`의 `/api/cron/weekly-report`를 매주 월요일 10:00 KST에 실행하도록 설정되어 있습니다. `CRON_SECRET`을 설정하면 `Authorization: Bearer <CRON_SECRET>` 요청만 허용합니다.
 
+`/api/cron/slack-event-jobs`는 Vercel Hobby 플랜에서는 Vercel Cron 대신 외부 cron으로 호출합니다. 권장 방식은 `cron-job.org`, `UptimeRobot`, GitHub Actions schedule, 또는 Upstash QStash입니다. 외부 cron은 아래처럼 호출합니다.
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $CRON_SECRET" \
+  https://<YOUR_DOMAIN>/api/cron/slack-event-jobs
+```
+
+Vercel Hobby에서는 `weekly-report`만 Vercel Cron으로 유지하고, Slack job reaper는 1분 주기의 외부 cron에 맡깁니다.
+
 Supabase에서는 `Supabase Dashboard -> Project Settings -> Database -> Connect -> ORM` 탭에서 값을 복사합니다.
 
 - `DATABASE_URL`: Transaction pooler를 선택한 뒤 Connection string을 복사합니다.
@@ -207,6 +217,7 @@ npm run prisma:seed
 9. `verify:production-readiness`가 PASS 하기 전에는 배포 완료로 보지 않습니다.
 10. seed는 명시 요청이 없는 한 운영 DB에서 실행하지 않습니다.
 11. stale `SlackEventJob` 수동 복구는 `npm run retry:slack-job -- --event-id <EVENT_ID>`를 사용합니다.
+12. Vercel Hobby에서는 Slack reaper를 Vercel Cron에 두지 말고 외부 cron으로 1분마다 호출합니다.
 
 ## TODO / 리스크
 
