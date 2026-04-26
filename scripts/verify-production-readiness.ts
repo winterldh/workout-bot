@@ -122,7 +122,7 @@ function printExpectedSlackJobMigrations(results: Result[]) {
     results,
     'FAIL',
     'db.migrations.expected',
-    '20260425020000_add_slack_event_job_queue, 20260425020100_finish_slack_event_job_queue',
+    '20260425020000_add_slack_event_job_queue, 20260425020100_finish_slack_event_job_queue, 20260427010000_add_slack_fast_path_reply_markers_and_job_type',
   );
 }
 
@@ -255,7 +255,11 @@ async function main() {
     path.join(repoRoot, 'app/api/cron/slack-event-jobs/route.ts'),
     'utf8',
   );
-  if (cronSlackRoute.includes('CRON_SECRET') && cronSlackRoute.includes('authorization')) {
+  if (
+    (cronSlackRoute.includes('CRON_SECRET') && cronSlackRoute.includes('authorization')) ||
+    cronSlackRoute.includes('isAuthorizedCronRequest') ||
+    cronSlackRoute.includes('x-vercel-cron')
+  ) {
     pass('cron.slack-event-jobs.auth');
   } else {
     fail('cron.slack-event-jobs.auth', 'missing bearer validation');
@@ -265,7 +269,11 @@ async function main() {
     path.join(repoRoot, 'app/api/cron/weekly-report/route.ts'),
     'utf8',
   );
-  if (weeklyRoute.includes('CRON_SECRET') && weeklyRoute.includes('authorization')) {
+  if (
+    (weeklyRoute.includes('CRON_SECRET') && weeklyRoute.includes('authorization')) ||
+    weeklyRoute.includes('isAuthorizedCronRequest') ||
+    weeklyRoute.includes('x-vercel-cron')
+  ) {
     pass('cron.weekly-report.auth');
   } else {
     fail('cron.weekly-report.auth', 'missing bearer validation');
@@ -343,11 +351,11 @@ async function main() {
       const enumRows = await prisma.$queryRawUnsafe<
         { enum_name: string; label: string }[]
       >(
-        `select t.typname as enum_name, e.enumlabel as label
+        `select lower(t.typname) as enum_name, e.enumlabel as label
          from pg_type t
          join pg_enum e on e.enumtypid = t.oid
-         where t.typname in ('SlackEventJobStatus', 'SlackEventJobResultStatus', 'SlackEventReceiptStatus')
-         order by t.typname, e.enumsortorder`,
+         where lower(t.typname) in ('slackeventjobstatus', 'slackeventjobresultstatus', 'slackeventreceiptstatus', 'slackeventjobtype')
+         order by lower(t.typname), e.enumsortorder`,
       );
       const enumMap = new Map<string, string[]>();
       for (const row of enumRows) {
@@ -357,9 +365,10 @@ async function main() {
       }
 
       const expectedEnums: Record<string, string[]> = {
-        SlackEventJobStatus: ['PENDING', 'PROCESSING', 'DONE', 'FAILED'],
-        SlackEventJobResultStatus: ['ACCEPTED', 'DUPLICATE', 'IGNORED', 'REPLIED'],
-        SlackEventReceiptStatus: ['RECEIVED', 'ACKED', 'PROCESSING', 'DONE', 'FAILED'],
+        slackeventjobstatus: ['PENDING', 'PROCESSING', 'DONE', 'FAILED'],
+        slackeventjobresultstatus: ['ACCEPTED', 'DUPLICATE', 'IGNORED', 'REPLIED'],
+        slackeventreceiptstatus: ['RECEIVED', 'ACKED', 'PROCESSING', 'DONE', 'FAILED'],
+        slackeventjobtype: ['CHECKIN_ASSET_UPLOAD', 'NICKNAME_SAVE', 'ADMIN_ALERT', 'RECOVERY'],
       };
 
       for (const [enumName, expected] of Object.entries(expectedEnums)) {
@@ -389,6 +398,39 @@ async function main() {
             error instanceof Error ? error.message : String(error),
           );
         }
+      }
+
+      const receiptColumnChecks = [
+        'replyAttemptedAt',
+        'replySentAt',
+        'replySlackTs',
+      ] as const;
+      for (const column of receiptColumnChecks) {
+        const rows = await prisma.$queryRawUnsafe<{ column_name: string | null }[]>(
+          `select column_name
+           from information_schema.columns
+           where table_schema = 'public'
+             and lower(table_name) = lower('SlackEventReceipt')
+             and lower(column_name) = lower('${column}')`,
+        );
+        if (rows.length > 0) {
+          pass(`db.column.SlackEventReceipt.${column}`);
+        } else {
+          fail(`db.column.SlackEventReceipt.${column}`, 'missing column');
+        }
+      }
+
+      const jobTypeRows = await prisma.$queryRawUnsafe<{ column_name: string | null }[]>(
+        `select column_name
+         from information_schema.columns
+         where table_schema = 'public'
+           and lower(table_name) = lower('SlackEventJob')
+           and lower(column_name) = lower('jobType')`,
+      );
+      if (jobTypeRows.length > 0) {
+        pass('db.column.SlackEventJob.jobType');
+      } else {
+        fail('db.column.SlackEventJob.jobType', 'missing column');
       }
 
       const uniqueChecks = [

@@ -1,20 +1,22 @@
 interface SlackApiResult {
   ok?: boolean;
   error?: string;
+  ts?: string;
+  channel?: string;
 }
 
 export function formatSlackMention(userId?: string | null) {
   return userId ? `<@${userId}>` : '';
 }
 
-export async function sendSlackMessage(input: {
+export async function postSlackMessage(input: {
   token?: string | null;
   channelId?: string | null;
   text: string;
   threadTs?: string;
-}): Promise<boolean> {
+}): Promise<SlackApiResult & { ok: boolean; ts?: string; channel?: string }> {
   if (!input.token || !input.channelId) {
-    return false;
+    return { ok: false };
   }
 
   try {
@@ -33,13 +35,23 @@ export async function sendSlackMessage(input: {
     const result = (await response.json()) as SlackApiResult;
     if (!response.ok || !result.ok) {
       console.warn('Slack chat.postMessage failed', result.error ?? response.statusText);
-      return false;
+      return { ok: false, error: result.error ?? response.statusText };
     }
-    return true;
+    return { ok: true, ts: result.ts, channel: result.channel };
   } catch (error) {
     console.warn('Slack chat.postMessage request failed', error);
-    return false;
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+export async function sendSlackMessage(input: {
+  token?: string | null;
+  channelId?: string | null;
+  text: string;
+  threadTs?: string;
+}): Promise<boolean> {
+  const result = await postSlackMessage(input);
+  return result.ok;
 }
 
 export async function sendSlackDirectMessage(input: {

@@ -128,7 +128,7 @@ type SlackEventReceiptClaimResult = {
   processing?: boolean;
 };
 
-async function claimSlackEventReceipt(input: {
+export async function claimSlackEventReceipt(input: {
   eventId?: string;
   requestId?: string;
   retryNum?: string | null;
@@ -258,7 +258,7 @@ async function claimSlackEventReceipt(input: {
   }
 }
 
-async function finalizeSlackEventReceipt(input: {
+export async function finalizeSlackEventReceipt(input: {
   eventId?: string;
   status: SlackEventReceiptStatus;
   intent?: string | null;

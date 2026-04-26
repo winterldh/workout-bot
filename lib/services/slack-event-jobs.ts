@@ -2,6 +2,7 @@ import {
   Prisma,
   SlackEventJobResultStatus,
   SlackEventJobStatus,
+  SlackEventJobType,
   SlackEventReceiptStatus,
 } from '@prisma/client';
 import { after } from 'next/server';
@@ -106,6 +107,7 @@ type SlackEventJobRecord = {
   slackUserId: string | null;
   groupId: string | null;
   goalId: string | null;
+  jobType: SlackEventJobType | null;
   intent: string | null;
   resultStatus: SlackEventJobResultStatus | null;
   payload: Prisma.JsonValue;
@@ -133,7 +135,54 @@ type EnqueueSlackEventJobInput = {
   requestId: string;
   retryNum?: string | null;
   retryReason?: string | null;
+  jobType?: SlackEventJobType | null;
 };
+
+export async function enqueueSlackBackgroundJob(input: {
+  eventId: string;
+  workspaceId: string;
+  channelId: string;
+  slackUserId?: string | null;
+  groupId?: string | null;
+  goalId?: string | null;
+  jobType: SlackEventJobType;
+  payload: Prisma.JsonObject;
+}) {
+  return prisma.slackEventJob.upsert({
+    where: {
+      workspaceId_eventId: {
+        workspaceId: input.workspaceId,
+        eventId: input.eventId,
+      },
+    },
+    create: {
+      eventId: input.eventId,
+      workspaceId: input.workspaceId,
+      channelId: input.channelId,
+      slackUserId: input.slackUserId ?? null,
+      groupId: input.groupId ?? null,
+      goalId: input.goalId ?? null,
+      jobType: input.jobType,
+      payload: input.payload,
+      status: SlackEventJobStatus.PENDING,
+    },
+    update: {
+      channelId: input.channelId,
+      slackUserId: input.slackUserId ?? null,
+      groupId: input.groupId ?? null,
+      goalId: input.goalId ?? null,
+      jobType: input.jobType,
+      payload: input.payload,
+      status: SlackEventJobStatus.PENDING,
+      attempts: 0,
+      lockedAt: null,
+      processingStartedAt: null,
+      processedAt: null,
+      nextRetryAt: null,
+      lastError: null,
+    },
+  });
+}
 
 type ClaimJobInput = {
   jobId?: string;
@@ -215,6 +264,7 @@ export async function enqueueSlackEventJob(input: EnqueueSlackEventJobInput) {
       slackUserId,
       groupId: null,
       goalId: null,
+      jobType: input.jobType ?? null,
       intent: null,
       payload: input.payload as Prisma.JsonObject,
       status: SlackEventJobStatus.PENDING,
@@ -223,6 +273,7 @@ export async function enqueueSlackEventJob(input: EnqueueSlackEventJobInput) {
       receiptId: receipt.id,
       channelId,
       slackUserId,
+      jobType: input.jobType ?? null,
       payload: input.payload as Prisma.JsonObject,
     },
   });
@@ -399,6 +450,26 @@ async function claimSlackEventJob(input: ClaimJobInput): Promise<SlackEventJobRe
 }
 
 async function processSlackEventJob(job: SlackEventJobRecord) {
+  if (job.jobType === SlackEventJobType.NICKNAME_SAVE) {
+    await processNicknameSaveBackgroundJob(job);
+    return;
+  }
+
+  if (job.jobType === SlackEventJobType.CHECKIN_ASSET_UPLOAD) {
+    await processCheckInAssetUploadBackgroundJob(job);
+    return;
+  }
+
+  if (job.jobType === SlackEventJobType.ADMIN_ALERT) {
+    await processAdminAlertBackgroundJob(job);
+    return;
+  }
+
+  if (job.jobType === SlackEventJobType.RECOVERY) {
+    await processRecoveryBackgroundJob(job);
+    return;
+  }
+
   const payload = job.payload as SlackEventPayload;
   const normalized = normalizeSlackEventPayload(payload);
   const event = payload.event as SlackMessageEvent | undefined;
@@ -1505,6 +1576,333 @@ async function finalizeJob(
       goalId: input.goalId ?? undefined,
       lockedAt: new Date(),
     },
+  });
+}
+
+async function processNicknameSaveBackgroundJob(job: SlackEventJobRecord) {
+  const payload = job.payload as {
+    workspaceId?: string;
+    channelId?: string;
+    slackUserId?: string;
+    groupId?: string;
+    nickname?: string;
+    providerUsername?: string;
+    requestId?: string;
+    eventId?: string;
+  };
+
+  if (!payload.workspaceId || !payload.slackUserId || !payload.groupId || !payload.nickname) {
+    await finalizeJob(job.id, {
+      status: SlackEventJobStatus.FAILED,
+      processedAt: new Date(),
+      resultStatus: SlackEventJobResultStatus.IGNORED,
+      lastError: 'invalid_nickname_save_payload',
+      groupId: payload.groupId ?? null,
+      goalId: job.goalId ?? null,
+    });
+    throw new Error('invalid_nickname_save_payload');
+  }
+
+  try {
+    const result = await registerSlackUserFromCommand({
+      db: prisma,
+      workspaceId: payload.workspaceId,
+      externalSlackId: payload.slackUserId,
+      displayName: payload.nickname,
+      groupId: payload.groupId,
+    });
+
+    if (result.status === 'invalid_name') {
+      throw new Error('invalid_nickname');
+    }
+
+    if (result.status === 'registered' || result.status === 'renamed') {
+      await ensureSlackUserMembership({
+        tx: prisma,
+        workspaceId: payload.workspaceId,
+        externalSlackId: payload.slackUserId,
+        displayName: payload.nickname,
+        providerUsername: payload.providerUsername,
+        groupId: payload.groupId,
+      });
+    }
+
+    await completeJob(job.id, {
+      resultStatus: SlackEventJobResultStatus.ACCEPTED,
+      groupId: payload.groupId,
+      goalId: job.goalId ?? undefined,
+    });
+
+    logEvent('info', 'slack.nickname_saved', {
+      eventType: 'slack_event_job',
+      jobId: job.id,
+      eventId: job.eventId,
+      workspaceId: payload.workspaceId,
+      channelId: payload.channelId,
+      slackUserId: payload.slackUserId,
+      groupId: payload.groupId,
+      nickname: payload.nickname,
+      status: result.status,
+    });
+  } catch (error) {
+    await notifyBackgroundJobFailure({
+      job,
+      jobType: 'NICKNAME_SAVE',
+      payload,
+      reason: error instanceof Error ? error.message : String(error),
+      alertText: [
+        '[운영 알림]',
+        '닉네임 저장에 실패했어요.',
+        '',
+        `Slack userId: ${payload.slackUserId}`,
+        `입력 닉네임: ${payload.nickname}`,
+      ].join('\n'),
+    });
+    throw error;
+  }
+}
+
+async function processCheckInAssetUploadBackgroundJob(job: SlackEventJobRecord) {
+  const payload = job.payload as {
+    workspaceId?: string;
+    channelId?: string;
+    slackUserId?: string;
+    rawSubmissionId?: string;
+    submissionAssetId?: string;
+    changeCandidateId?: string;
+    sourceMessageId?: string;
+    recordDate?: string;
+    selectedFile?: {
+      id?: string;
+      mimetype?: string;
+      size?: number;
+      url_private?: string;
+      url_private_download?: string;
+    };
+  };
+
+  if (!payload.workspaceId || !payload.channelId || !payload.sourceMessageId || !payload.selectedFile) {
+    await finalizeJob(job.id, {
+      status: SlackEventJobStatus.FAILED,
+      processedAt: new Date(),
+      resultStatus: SlackEventJobResultStatus.IGNORED,
+      lastError: 'invalid_asset_upload_payload',
+      groupId: job.groupId ?? null,
+      goalId: job.goalId ?? null,
+    });
+    throw new Error('invalid_asset_upload_payload');
+  }
+
+  const integration = await prisma.slackIntegration.findUnique({
+    where: {
+      workspaceId_channelId: {
+        workspaceId: payload.workspaceId,
+        channelId: payload.channelId,
+      },
+    },
+    include: { group: true, goal: true },
+  });
+
+  if (!integration) {
+    await finalizeJob(job.id, {
+      status: SlackEventJobStatus.FAILED,
+      processedAt: new Date(),
+      resultStatus: SlackEventJobResultStatus.IGNORED,
+      lastError: 'integration_not_found',
+      groupId: job.groupId ?? null,
+      goalId: job.goalId ?? null,
+    });
+    throw new Error('integration_not_found');
+  }
+
+  const slackFileUrl = payload.selectedFile.url_private_download ?? payload.selectedFile.url_private;
+  if (!slackFileUrl) {
+    await notifyBackgroundJobFailure({
+      job,
+      jobType: 'CHECKIN_ASSET_UPLOAD',
+      payload,
+      reason: 'missing_slack_file_url',
+        alertText: [
+          '[운영 알림]',
+          '사진 저장에 실패했어요.',
+          '',
+          `유저: ${payload.slackUserId ?? '-'}`,
+          `채널: ${payload.channelId}`,
+          `기록일: ${payload.recordDate ?? '-'}`,
+          '',
+          '원본 Slack 파일 URL은 남아 있습니다.',
+        ].join('\n'),
+      });
+    throw new Error('missing_slack_file_url');
+  }
+
+  const photo = await storeSlackPhotoToBlob({
+    slackFileUrl,
+    botToken: integration.botToken ?? process.env.SLACK_BOT_TOKEN ?? undefined,
+    workspaceId: payload.workspaceId,
+    channelId: payload.channelId,
+    sourceMessageId: payload.sourceMessageId,
+    mimeType: payload.selectedFile.mimetype,
+    fileId: payload.selectedFile.id ?? null,
+    fileSize: payload.selectedFile.size ?? null,
+    context: {
+      jobId: job.id,
+      eventId: job.eventId,
+      workspaceId: payload.workspaceId,
+      channelId: payload.channelId,
+      slackUserId: payload.slackUserId ?? undefined,
+      groupId: job.groupId ?? undefined,
+      goalId: job.goalId ?? undefined,
+    },
+  });
+
+  if (payload.rawSubmissionId) {
+    await updateSlackSubmissionAsset({
+      rawSubmissionId: payload.rawSubmissionId,
+      blobUrl: photo.blobUrl,
+      storageKey: photo.storageKey,
+      uploadFailed: photo.uploadFailed,
+      mimeType: photo.mimeType ?? payload.selectedFile.mimetype ?? null,
+      slackOriginalUrl: photo.slackOriginalUrl,
+    });
+  }
+
+  if (payload.changeCandidateId) {
+    await updateSlackChangeCandidateAsset({
+      candidateId: payload.changeCandidateId,
+      blobUrl: photo.blobUrl,
+      uploadFailed: photo.uploadFailed,
+      mimeType: photo.mimeType ?? payload.selectedFile.mimetype ?? null,
+      slackOriginalUrl: photo.slackOriginalUrl,
+    });
+  }
+
+  if (!photo.blobUrl) {
+    await notifyBackgroundJobFailure({
+      job,
+      jobType: 'CHECKIN_ASSET_UPLOAD',
+      payload,
+      reason: 'asset_upload_failed',
+        alertText: [
+          '[운영 알림]',
+          '사진 저장에 실패했어요.',
+          '',
+          `유저: ${payload.slackUserId ?? '-'}`,
+          `채널: ${payload.channelId}`,
+          `기록일: ${payload.recordDate ?? '-'}`,
+          '',
+          '원본 Slack 파일 URL은 남아 있습니다.',
+        ].join('\n'),
+      });
+    throw new Error('asset_upload_failed');
+  }
+
+  await prisma.slackEventJob.update({
+    where: { id: job.id },
+    data: {
+      status: SlackEventJobStatus.DONE,
+      processedAt: new Date(),
+      resultStatus: SlackEventJobResultStatus.ACCEPTED,
+      assetUploadedAt: new Date(),
+      lastError: null,
+    },
+  });
+
+  logEvent('info', 'slack.asset_upload_success', {
+    eventType: 'slack_event_job',
+    jobId: job.id,
+    eventId: job.eventId,
+    workspaceId: payload.workspaceId,
+    channelId: payload.channelId,
+    slackUserId: payload.slackUserId,
+    rawSubmissionId: payload.rawSubmissionId ?? undefined,
+    submissionAssetId: payload.submissionAssetId ?? undefined,
+    changeCandidateId: payload.changeCandidateId ?? undefined,
+  });
+}
+
+async function processAdminAlertBackgroundJob(job: SlackEventJobRecord) {
+  const payload = job.payload as {
+    ownerUserId?: string;
+    slackUserId?: string;
+    text?: string;
+  };
+
+  const ownerUserId = payload.ownerUserId ?? process.env.SLACK_OWNER_USER_ID?.trim();
+  if (!ownerUserId) {
+    await finalizeJob(job.id, {
+      status: SlackEventJobStatus.DONE,
+      processedAt: new Date(),
+      resultStatus: SlackEventJobResultStatus.IGNORED,
+      lastError: null,
+      groupId: job.groupId ?? null,
+      goalId: job.goalId ?? null,
+    });
+    logEvent('warn', 'slack.admin_alert_skipped', {
+      eventType: 'slack_event_job',
+      jobId: job.id,
+      eventId: job.eventId,
+      reason: 'missing_owner_user_id',
+    });
+    return;
+  }
+
+  await sendSlackDirectMessage({
+    token: process.env.SLACK_BOT_TOKEN ?? undefined,
+    userId: ownerUserId,
+    text: payload.text ?? '[운영 알림] 알림 내용이 없습니다.',
+  });
+
+  await completeJob(job.id, {
+    resultStatus: SlackEventJobResultStatus.REPLIED,
+    groupId: job.groupId ?? undefined,
+    goalId: job.goalId ?? undefined,
+  });
+}
+
+async function processRecoveryBackgroundJob(job: SlackEventJobRecord) {
+  await completeJob(job.id, {
+    resultStatus: SlackEventJobResultStatus.IGNORED,
+    groupId: job.groupId ?? undefined,
+    goalId: job.goalId ?? undefined,
+  });
+  logEvent('info', 'slack.recovery_job_completed', {
+    eventType: 'slack_event_job',
+    jobId: job.id,
+    eventId: job.eventId,
+    jobType: job.jobType ?? undefined,
+  });
+}
+
+async function notifyBackgroundJobFailure(input: {
+  job: SlackEventJobRecord;
+  jobType: SlackEventJobType;
+  payload: Record<string, any>;
+  reason: string;
+  alertText: string;
+}) {
+  logEvent('warn', 'slack.background_job_failed', {
+    eventType: 'slack_event_job',
+    jobId: input.job.id,
+    eventId: input.job.eventId,
+    jobType: input.jobType,
+    workspaceId: input.payload.workspaceId,
+    channelId: input.payload.channelId,
+    slackUserId: input.payload.slackUserId,
+    groupId: input.payload.groupId ?? input.job.groupId ?? undefined,
+    goalId: input.payload.goalId ?? input.job.goalId ?? undefined,
+    reason: input.reason,
+  });
+
+  const ownerUserId = process.env.SLACK_OWNER_USER_ID?.trim();
+  if (!ownerUserId) {
+    return;
+  }
+
+  await sendSlackDirectMessage({
+    token: process.env.SLACK_BOT_TOKEN ?? undefined,
+    userId: ownerUserId,
+    text: input.alertText,
   });
 }
 

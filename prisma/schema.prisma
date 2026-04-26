@@ -71,6 +71,13 @@ enum SlackEventJobResultStatus {
   REPLIED
 }
 
+enum SlackEventJobType {
+  CHECKIN_ASSET_UPLOAD
+  NICKNAME_SAVE
+  ADMIN_ALERT
+  RECOVERY
+}
+
 enum SubmissionAssetKind {
   IMAGE
   VIDEO
@@ -237,6 +244,9 @@ model SlackEventReceipt {
   processedAt DateTime?
   receivedAt  DateTime               @default(now())
   ackAt       DateTime?
+  replyAttemptedAt DateTime?
+  replySentAt DateTime?
+  replySlackTs String?
   createdAt   DateTime               @default(now())
   updatedAt   DateTime               @updatedAt
   job         SlackEventJob?
@@ -254,6 +264,7 @@ model SlackEventJob {
   slackUserId           String?
   groupId               String?
   goalId                String?
+  jobType               SlackEventJobType?
   intent                String?
   resultStatus          SlackEventJobResultStatus?
   payload               Json
@@ -276,6 +287,7 @@ model SlackEventJob {
   receipt               SlackEventReceipt?        @relation(fields: [receiptId], references: [id], onDelete: Cascade)
 
   @@unique([workspaceId, eventId])
+  @@index([jobType, status, nextRetryAt, lockedAt])
   @@index([status, nextRetryAt, lockedAt])
   @@index([workspaceId, channelId, status, createdAt])
   @@index([groupId, status, createdAt])

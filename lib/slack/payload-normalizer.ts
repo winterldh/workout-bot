@@ -53,9 +53,14 @@ export function normalizeSlackEventPayload(
 export function validateSlackEventPayloadForWrite(
   normalized: NormalizedSlackEventPayload,
 ): SlackPayloadValidationResult {
-  const missingFields = ['eventId', 'workspaceId', 'channelId'].filter((field) => {
+  const requiredFields: Array<keyof Pick<
+    NormalizedSlackEventPayload,
+    'eventId' | 'workspaceId' | 'eventType' | 'payloadType' | 'channelId'
+  >> = ['eventId', 'workspaceId', 'eventType', 'payloadType', 'channelId'];
+
+  const missingFields = requiredFields.filter((field) => {
     const key = field as keyof NormalizedSlackEventPayload;
-    return normalized[key] === null;
+    return normalized[key] === null || normalized[key] === '';
   });
 
   return {

@@ -1,10 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import {
-  ackSlackEventReceipt,
-  enqueueSlackEventJob,
-  scheduleSlackEventJobProcessing,
-} from '@/lib/services/slack-event-jobs';
 import { logEvent } from '@/lib/observability/logger';
+import { processSlackFastPath } from '@/lib/services/slack-fast-path';
 import {
   normalizeSlackEventPayload,
   validateSlackEventPayloadForWrite,
@@ -96,27 +92,20 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ ok: true, received: true });
       }
 
-      const { receipt, job } = await enqueueSlackEventJob({
-        payload,
-        normalized,
-        requestId,
-        retryNum,
-        retryReason,
-      });
-
-      if (receipt) {
-        await ackSlackEventReceipt({ receiptId: receipt.id }).catch((error) => {
-          logEvent('warn', 'slack.receipt_ack_failed', {
+      after(() => {
+        void processSlackFastPath({
+          payload,
+          requestId,
+          retryNum,
+          retryReason,
+        }).catch((error) => {
+          logEvent('error', 'slack.event_failed', {
             eventType: 'slack_event',
             requestId,
             eventId: normalized.eventId ?? undefined,
             reason: error instanceof Error ? error.message : String(error),
           });
         });
-      }
-
-      after(() => {
-        void scheduleSlackEventJobProcessing({ jobId: job?.id });
       });
 
       return NextResponse.json({ ok: true, received: true });
