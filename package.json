@@ -8,7 +8,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "prisma:seed": "prisma db seed"
+    "prisma:seed": "prisma db seed",
+    "verify:slack-payload": "ts-node --project tsconfig.base.json scripts/verify-slack-payload-normalizer.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

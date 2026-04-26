@@ -38,6 +38,12 @@ import { formatSlackMention, sendSlackDirectMessage, sendSlackMessage } from '@/
 import { storeSlackPhotoToBlob } from '@/lib/slack/file-storage';
 import { analyzeSlackIntent } from '@/lib/services/slack';
 import { toSlackTimestampDate } from '@/lib/domain/date';
+import {
+  normalizeSlackEventPayload,
+  validateSlackEventPayloadForWrite,
+  type NormalizedSlackEventPayload,
+  type SlackEventPayload,
+} from '@/lib/slack/payload-normalizer';
 
 const STALE_PROCESSING_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
@@ -121,10 +127,9 @@ type SlackEventJobRecord = {
   updatedAt: Date;
 };
 
-type SlackEventPayload = Record<string, any>;
-
 type EnqueueSlackEventJobInput = {
   payload: SlackEventPayload;
+  normalized?: NormalizedSlackEventPayload;
   requestId: string;
   retryNum?: string | null;
   retryReason?: string | null;
@@ -139,15 +144,29 @@ type ClaimJobInput = {
 };
 
 export async function enqueueSlackEventJob(input: EnqueueSlackEventJobInput) {
-  const eventId = typeof input.payload.event_id === 'string' ? input.payload.event_id : null;
-  const workspaceId = input.payload.authorizations?.[0]?.team_id ?? input.payload.team_id ?? null;
-  const event = input.payload.event as SlackMessageEvent | undefined;
-  const channelId = event?.channel ?? null;
-  const slackUserId = event?.user ?? null;
+  const normalized = input.normalized ?? normalizeSlackEventPayload(input.payload);
+  const validation = validateSlackEventPayloadForWrite(normalized);
 
-  if (!eventId || !workspaceId || !channelId) {
+  if (!validation.ok) {
+    logEvent('warn', 'slack.event_ignored_invalid_payload', {
+      eventType: 'slack_event_job',
+      requestId: input.requestId,
+      eventId: normalized.eventId ?? undefined,
+      workspaceId: normalized.workspaceId ?? undefined,
+      channelId: normalized.channelId ?? undefined,
+      slackUserId: normalized.slackUserId ?? undefined,
+      payloadType: normalized.payloadType,
+      eventTypeValue: normalized.eventType,
+      missingFields: validation.missingFields,
+      reason: validation.reason,
+    });
     return { receipt: null, job: null };
   }
+
+  const eventId = normalized.eventId as string;
+  const workspaceId = normalized.workspaceId as string;
+  const channelId = normalized.channelId as string;
+  const slackUserId = normalized.slackUserId;
 
   const receipt = await prisma.slackEventReceipt.upsert({
     where: {
@@ -162,6 +181,7 @@ export async function enqueueSlackEventJob(input: EnqueueSlackEventJobInput) {
       workspaceId,
       channelId,
       slackUserId,
+      eventType: normalized.eventType,
       retryNum: toPositiveInteger(input.retryNum),
       retryReason: input.retryReason ?? null,
       status: SlackEventReceiptStatus.RECEIVED,
@@ -171,6 +191,7 @@ export async function enqueueSlackEventJob(input: EnqueueSlackEventJobInput) {
       requestId: input.requestId,
       channelId,
       slackUserId,
+      eventType: normalized.eventType,
       retryNum: toPositiveInteger(input.retryNum),
       retryReason: input.retryReason ?? null,
       status: SlackEventReceiptStatus.RECEIVED,
@@ -362,11 +383,12 @@ async function claimSlackEventJob(input: ClaimJobInput): Promise<SlackEventJobRe
 
 async function processSlackEventJob(job: SlackEventJobRecord) {
   const payload = job.payload as SlackEventPayload;
+  const normalized = normalizeSlackEventPayload(payload);
   const event = payload.event as SlackMessageEvent | undefined;
-  const eventType = payload.type ?? 'event_callback';
+  const eventType = normalized.eventType;
   const workspaceId = job.workspaceId;
   const channelId = job.channelId;
-  const slackUserId = job.slackUserId ?? event?.user ?? undefined;
+  const slackUserId = job.slackUserId ?? normalized.slackUserId ?? event?.user ?? undefined;
   const botUserId = process.env.SLACK_BOT_USER_ID?.trim();
   const token = process.env.SLACK_BOT_TOKEN ?? undefined;
   const intentAnalysis = analyzeSlackIntent(payload, event ?? {}, botUserId, {

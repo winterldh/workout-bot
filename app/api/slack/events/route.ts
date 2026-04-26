@@ -5,6 +5,10 @@ import {
   scheduleSlackEventJobProcessing,
 } from '@/lib/services/slack-event-jobs';
 import { logEvent } from '@/lib/observability/logger';
+import {
+  normalizeSlackEventPayload,
+  validateSlackEventPayloadForWrite,
+} from '@/lib/slack/payload-normalizer';
 import { SlackRequestError, verifySlackSignature } from '@/lib/slack/signature';
 import { randomUUID } from 'node:crypto';
 import { after } from 'next/server';
@@ -37,27 +41,33 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ ok: true, ignored: true });
     }
 
+    const normalized = normalizeSlackEventPayload(payload);
+    const validation = validateSlackEventPayloadForWrite(normalized);
+
     logEvent('info', 'slack.event_received', {
       eventType: 'slack_event',
       requestId,
-      eventId: payload.event_id ?? null,
+      eventId: normalized.eventId ?? undefined,
       retryNum,
       retryReason,
-      payloadType: payload.type ?? null,
+      payloadType: normalized.payloadType,
+      workspaceId: normalized.workspaceId ?? undefined,
+      channelId: normalized.channelId ?? undefined,
+      slackUserId: normalized.slackUserId ?? undefined,
     });
 
-    if (payload.type === 'url_verification') {
+    if (normalized.payloadType === 'url_verification') {
       logEvent('info', 'slack.url_verification', {
         eventType: 'slack_event',
         requestId,
-        eventId: payload.event_id ?? null,
+        eventId: normalized.eventId ?? undefined,
       });
       return NextResponse.json({ challenge: payload.challenge });
     }
 
     const eventContext = {
       requestId,
-      eventId: payload.event_id ?? undefined,
+      eventId: normalized.eventId ?? undefined,
       retryNum,
       retryReason,
     };
@@ -69,9 +79,26 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    if (payload.type === 'event_callback') {
+    if (normalized.payloadType === 'event_callback') {
+      if (!validation.ok) {
+        logEvent('warn', 'slack.event_ignored_invalid_payload', {
+          eventType: 'slack_event',
+          requestId,
+          eventId: normalized.eventId ?? undefined,
+          workspaceId: normalized.workspaceId ?? undefined,
+          channelId: normalized.channelId ?? undefined,
+          slackUserId: normalized.slackUserId ?? undefined,
+          payloadType: normalized.payloadType,
+          eventTypeValue: normalized.eventType,
+          missingFields: validation.missingFields,
+          reason: validation.reason,
+        });
+        return NextResponse.json({ ok: true, received: true });
+      }
+
       const { receipt, job } = await enqueueSlackEventJob({
         payload,
+        normalized,
         requestId,
         retryNum,
         retryReason,
@@ -82,7 +109,7 @@ export async function POST(request: NextRequest) {
           logEvent('warn', 'slack.receipt_ack_failed', {
             eventType: 'slack_event',
             requestId,
-            eventId: payload.event_id ?? null,
+            eventId: normalized.eventId ?? undefined,
             reason: error instanceof Error ? error.message : String(error),
           });
         });
