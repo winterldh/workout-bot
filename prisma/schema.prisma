@@ -84,6 +84,13 @@ enum SubmissionAssetKind {
   FILE
 }
 
+enum SubmissionAssetStatus {
+  PENDING
+  PROCESSING
+  ASSET_SAVED
+  ASSET_FAILED
+}
+
 model User {
   id             String            @id @default(cuid())
   displayName    String
@@ -323,6 +330,12 @@ model SubmissionAsset {
   kind            SubmissionAssetKind @default(IMAGE)
   mimeType        String?
   blobUrl         String?
+  assetStatus     SubmissionAssetStatus @default(PENDING)
+  assetRetryCount Int                 @default(0)
+  assetLastError  String?
+  assetLockedAt   DateTime?
+  assetProcessedAt DateTime?
+  assetNextRetryAt DateTime?
   originalPhotoUrl String?
   slackOriginalUrl String?
   // legacy compatibility field, kept for old dashboard/history readers
@@ -333,6 +346,7 @@ model SubmissionAsset {
   rawSubmission   RawSubmission       @relation(fields: [rawSubmissionId], references: [id])
 
   @@index([rawSubmissionId])
+  @@index([assetStatus, assetNextRetryAt, assetLockedAt])
 }
 
 model WeeklyReportRun {

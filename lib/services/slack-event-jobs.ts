@@ -4,6 +4,7 @@ import {
   SlackEventJobStatus,
   SlackEventJobType,
   SlackEventReceiptStatus,
+  SubmissionAssetStatus,
 } from '@prisma/client';
 import { after } from 'next/server';
 import { prisma } from '@/lib/prisma';
@@ -1517,6 +1518,13 @@ async function processSlackPhotoUpload(input: {
       uploadFailed: photo.uploadFailed,
       mimeType: photo.mimeType ?? input.selectedFile.mimetype ?? null,
       slackOriginalUrl: photo.slackOriginalUrl,
+      assetStatus: photo.blobUrl
+        ? SubmissionAssetStatus.ASSET_SAVED
+        : SubmissionAssetStatus.ASSET_FAILED,
+      assetRetryCount: input.job.attempts,
+      assetLockedAt: null,
+      assetProcessedAt: photo.blobUrl ? new Date() : null,
+      assetNextRetryAt: photo.blobUrl ? null : nextRetryAtForAttempt(input.job.attempts),
     });
   }
 
@@ -1715,6 +1723,54 @@ async function processCheckInAssetUploadBackgroundJob(job: SlackEventJobRecord) 
     throw new Error('integration_not_found');
   }
 
+  const assetClaim = await prisma.submissionAsset.updateMany({
+    where: {
+      rawSubmissionId: payload.rawSubmissionId,
+      blobUrl: null,
+      OR: [
+        { assetStatus: SubmissionAssetStatus.PENDING },
+        {
+          assetStatus: SubmissionAssetStatus.PROCESSING,
+          assetLockedAt: {
+            lt: new Date(Date.now() - PROCESSING_LEASE_MS),
+          },
+        },
+        {
+          assetStatus: SubmissionAssetStatus.ASSET_FAILED,
+          OR: [
+            { assetNextRetryAt: null },
+            { assetNextRetryAt: { lte: new Date() } },
+          ],
+        },
+      ],
+    },
+    data: {
+      assetStatus: SubmissionAssetStatus.PROCESSING,
+      assetLockedAt: new Date(),
+      assetRetryCount: { increment: 1 },
+      assetLastError: null,
+    },
+  });
+
+  if (assetClaim.count === 0) {
+    logEvent('info', 'slack.asset_upload_skipped', {
+      eventType: 'slack_event_job',
+      jobId: job.id,
+      eventId: job.eventId,
+      workspaceId: payload.workspaceId,
+      channelId: payload.channelId,
+      slackUserId: payload.slackUserId,
+      rawSubmissionId: payload.rawSubmissionId ?? undefined,
+      reason: 'asset_already_processed_or_locked',
+    });
+    await completeJob(job.id, {
+      resultStatus: SlackEventJobResultStatus.IGNORED,
+      groupId: job.groupId ?? undefined,
+      goalId: job.goalId ?? undefined,
+    });
+    return;
+  }
+
   const slackFileUrl = payload.selectedFile.url_private_download ?? payload.selectedFile.url_private;
   if (!slackFileUrl) {
     await notifyBackgroundJobFailure({
@@ -1764,6 +1820,13 @@ async function processCheckInAssetUploadBackgroundJob(job: SlackEventJobRecord) 
       uploadFailed: photo.uploadFailed,
       mimeType: photo.mimeType ?? payload.selectedFile.mimetype ?? null,
       slackOriginalUrl: photo.slackOriginalUrl,
+      assetStatus: photo.blobUrl
+        ? SubmissionAssetStatus.ASSET_SAVED
+        : SubmissionAssetStatus.ASSET_FAILED,
+      assetRetryCount: job.attempts,
+      assetLockedAt: null,
+      assetProcessedAt: photo.blobUrl ? new Date() : null,
+      assetNextRetryAt: photo.blobUrl ? null : nextRetryAtForAttempt(job.attempts),
     });
   }
 

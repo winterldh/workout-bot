@@ -2,6 +2,7 @@ import {
   CheckInRecordStatus,
   MembershipRole,
   SubmissionAssetKind,
+  SubmissionAssetStatus,
   SubmissionSourceType,
 } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
@@ -230,20 +231,38 @@ export async function createFromSlackMessage(input: {
                 uploadFailed: Boolean(input.photo.uploadFailed),
               }
             : null,
-          assetStatus: input.photo ? (input.photo.uploadFailed ? 'failed' : 'pending') : null,
+          assetStatus: input.photo
+            ? input.photo.uploadFailed
+              ? 'ASSET_FAILED'
+              : input.photo.blobUrl
+                ? 'ASSET_SAVED'
+                : 'PENDING'
+            : null,
         },
       },
     });
 
     let submissionAssetId: string | undefined;
     if (input.photo) {
-      const submissionAsset = await tx.submissionAsset.create({
+    const submissionAssetStatus = input.photo?.uploadFailed
+      ? SubmissionAssetStatus.ASSET_FAILED
+      : input.photo?.blobUrl
+        ? SubmissionAssetStatus.ASSET_SAVED
+        : SubmissionAssetStatus.PENDING;
+
+    const submissionAsset = await tx.submissionAsset.create({
         data: {
           rawSubmissionId: rawSubmission.id,
           kind: SubmissionAssetKind.IMAGE,
           mimeType: input.photo.mimeType ?? 'image/jpeg',
           originalUrl: submissionBlobUrl,
           blobUrl: input.photo.uploadFailed ? null : input.photo.blobUrl ?? null,
+          assetStatus: submissionAssetStatus,
+          assetRetryCount: 0,
+          assetLastError: input.photo.uploadFailed ? 'asset_upload_failed' : null,
+          assetLockedAt: null,
+          assetProcessedAt: input.photo?.blobUrl ? new Date() : null,
+          assetNextRetryAt: null,
           originalPhotoUrl: submissionOriginalUrl,
           slackOriginalUrl: submissionOriginalUrl,
           storageKey: input.photo.storageKey,
@@ -297,6 +316,12 @@ export async function updateSlackSubmissionAsset(input: {
   uploadFailed?: boolean;
   mimeType?: string | null;
   slackOriginalUrl?: string | null;
+  assetStatus?: SubmissionAssetStatus;
+  assetRetryCount?: number;
+  assetLastError?: string | null;
+  assetLockedAt?: Date | null;
+  assetProcessedAt?: Date | null;
+  assetNextRetryAt?: Date | null;
 }) {
   const updated = await prisma.submissionAsset.updateMany({
     where: {
@@ -309,6 +334,20 @@ export async function updateSlackSubmissionAsset(input: {
       originalUrl: input.blobUrl ?? input.slackOriginalUrl ?? undefined,
       originalPhotoUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
       slackOriginalUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
+      assetStatus:
+        input.assetStatus ??
+        (input.uploadFailed
+          ? SubmissionAssetStatus.ASSET_FAILED
+          : input.blobUrl
+            ? SubmissionAssetStatus.ASSET_SAVED
+            : SubmissionAssetStatus.PENDING),
+      assetRetryCount: input.assetRetryCount ?? undefined,
+      assetLastError: input.assetLastError ?? (input.uploadFailed ? 'asset_upload_failed' : null),
+      assetLockedAt: input.assetLockedAt ?? null,
+      assetProcessedAt:
+        input.assetProcessedAt ??
+        (input.blobUrl ? new Date() : undefined),
+      assetNextRetryAt: input.assetNextRetryAt ?? undefined,
       metadata: input.uploadFailed
         ? { blobUploadFailed: true, blobStatus: 'failed' }
         : input.blobUrl

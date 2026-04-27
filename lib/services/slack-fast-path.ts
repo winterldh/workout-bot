@@ -52,7 +52,6 @@ type FastPathInput = {
 };
 
 const REPLY_STALE_MS = 2 * 60 * 1000;
-const NICKNAME_SAVE_PENDING_MAX_ATTEMPTS = 3;
 
 export async function processSlackFastPath(input: FastPathInput) {
   if (input.payload.type !== 'event_callback' || !input.payload.event) {
@@ -869,10 +868,7 @@ async function hasPendingNicknameSaveJob(input: { workspaceId: string; slackUser
       OR: [
         { status: SlackEventJobStatus.PENDING },
         { status: SlackEventJobStatus.PROCESSING },
-        {
-          status: SlackEventJobStatus.FAILED,
-          attempts: { lt: NICKNAME_SAVE_PENDING_MAX_ATTEMPTS },
-        },
+        { status: SlackEventJobStatus.FAILED },
       ],
     },
     select: { id: true },

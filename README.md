@@ -8,12 +8,14 @@ Slack 전용 운동 인증 MVP입니다. 기존 NestJS API와 Next.js web worksp
 app/
   api/
     health/route.ts
+    check-ins/route.ts
     dashboard/summary/route.ts
     slack/events/route.ts
     slack/commands/status/route.ts
     rankings/route.ts
     reports/weekly/route.ts
     cron/weekly-report/route.ts
+    jobs/process-pending-assets/route.ts
   page.tsx
   check-ins/page.tsx
   ranking/page.tsx
@@ -50,6 +52,7 @@ SLACK_SIGNATURE_VERIFICATION_DISABLED
 
 `DATABASE_URL`은 앱 런타임용 Supabase Transaction pooler URI, `DIRECT_URL`은 Prisma migration용 Supabase Direct connection URI입니다. `BLOB_READ_WRITE_TOKEN`은 Slack private file을 Vercel Blob에 저장할 때 필요하고, `CRON_SECRET`은 주간 리포트 Cron 보호용입니다.
 `WEEKLY_PENALTY_TEXT`는 `GroupSetting.weeklyPenaltyText`가 없을 때만 사용하는 fallback입니다.
+`SubmissionAsset.assetStatus`는 `PENDING / PROCESSING / ASSET_SAVED / ASSET_FAILED`로 바뀌며, 카드 화면은 blob 저장이 끝나기 전에도 먼저 표시됩니다.
 
 ## 로컬 실행
 
@@ -94,6 +97,16 @@ curl -X POST \
 
 Vercel Hobby에서는 `weekly-report`만 Vercel Cron으로 유지하고, Slack job reaper는 1분 주기의 외부 cron에 맡깁니다.
 
+`/api/jobs/process-pending-assets`는 관리자 수동 실행이나 별도 외부 cron에서 사용할 수 있습니다.
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $CRON_SECRET" \
+  "https://<YOUR_DOMAIN>/api/jobs/process-pending-assets?limit=10"
+```
+
+이 경로는 `SubmissionAsset`의 `PENDING`, `PROCESSING`, `ASSET_FAILED` 중 처리 대상만 N개씩 가져와서 blob 업로드를 이어서 처리합니다. 카드 화면은 `이미지 처리중` placeholder를 먼저 보여주고, 새로고침 시 blob이 생기면 실제 이미지를 보여줍니다.
+
 Supabase에서는 `Supabase Dashboard -> Project Settings -> Database -> Connect -> ORM` 탭에서 값을 복사합니다.
 
 - `DATABASE_URL`: Transaction pooler를 선택한 뒤 Connection string을 복사합니다.
@@ -135,6 +148,7 @@ npm run prisma:seed
 - DM, thread reply, bot message, `message_changed`, `message_deleted`는 무시합니다.
 - `<@BOT_USER_ID> 닉네임 설정 홍길동`: Slack userId 기준 내부 사용자 등록 또는 displayName 변경을 처리합니다.
 - `<@BOT_USER_ID> 인증 + 이미지`: 등록 유저만 저장하고, 성공 시 스레드 피드백 + 채널 현황 업데이트를 전송합니다.
+- `GET /api/check-ins`는 최근 인증/제출 타임라인을 최신순으로 반환합니다.
 - `<@BOT_USER_ID> 변경 + 이미지`: 오늘 인증 이미지를 교체 요청합니다.
 - `<@BOT_USER_ID> 목표확인`: 현재 목표/패널티와 내 진행도를 스레드로 반환합니다.
 - `<@BOT_USER_ID> 현황`: 이번 주 전체 현황을 스레드로 반환합니다.
@@ -185,6 +199,7 @@ npm run prisma:seed
 - Blob 업로드 실패가 반복되면 Slack 토큰 권한과 Vercel Blob 토큰을 우선 점검합니다.
 - weekly report는 `WeeklyReportRun` 테이블의 `runKey`로 중복 실행을 막고, 30분 이상 오래된 RUNNING 상태만 재시도합니다.
 - Slack Events는 `SlackEventReceipt`의 `PROCESSING / DONE / FAILED` 상태와 2분 stale 기준으로 중복과 재처리를 다룹니다.
+- `SubmissionAsset`의 `assetStatus`는 `PENDING`이면 이미지 처리중, `ASSET_SAVED`면 이미지 표시, `ASSET_FAILED`면 실패 placeholder로 해석합니다.
 - 설정 관련 변경이 있으면 `npm run prisma:generate`와 `npx prisma migrate deploy`가 먼저 통과해야 배포 완료로 봅니다.
 
 ### Slack 연동 URL
