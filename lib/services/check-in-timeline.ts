@@ -24,6 +24,8 @@ type TimelineAsset = {
   assetLastError: string | null;
   assetProcessedAt: Date | null;
   createdAt: Date;
+  originalPhotoUrl: string | null;
+  slackOriginalUrl: string | null;
 };
 
 type TimelineRawSubmission = {
@@ -70,6 +72,10 @@ export type CheckInTimelineItem = {
   rejected: boolean;
   assetStatus: SubmissionAssetStatus | 'NONE';
   imageUrl: string | null;
+  imageUrlHost: string | null;
+  originalPhotoUrl: string | null;
+  retryCount: number;
+  lastError: string | null;
   note: string | null;
   statusLabel: string;
   assetLabel: string;
@@ -133,6 +139,8 @@ export async function getCheckInTimeline(input: {
               assetLastError: true,
               assetProcessedAt: true,
               createdAt: true,
+              originalPhotoUrl: true,
+              slackOriginalUrl: true,
             },
             orderBy: { createdAt: 'asc' },
           },
@@ -223,6 +231,7 @@ function buildRawSubmissionItem(rawSubmission: TimelineRawSubmission): CheckInTi
   const assetStatus =
     latestAsset?.assetStatus ??
     (latestAsset?.blobUrl ? SubmissionAssetStatus.ASSET_SAVED : SubmissionAssetStatus.PENDING);
+  const imageUrl = sanitizeBrowserImageUrl(latestAsset?.blobUrl);
 
   const rejected = latestRecord?.status === CheckInRecordStatus.REJECTED;
   const countIncluded = latestRecord?.status === CheckInRecordStatus.APPROVED;
@@ -238,18 +247,26 @@ function buildRawSubmissionItem(rawSubmission: TimelineRawSubmission): CheckInTi
     duplicate: false,
     rejected,
     assetStatus,
-    imageUrl: latestAsset?.blobUrl ?? null,
+    imageUrl,
+    imageUrlHost: getUrlHost(imageUrl),
+    originalPhotoUrl: latestAsset?.originalPhotoUrl ?? latestAsset?.slackOriginalUrl ?? null,
+    retryCount: latestAsset?.assetRetryCount ?? 0,
+    lastError: latestAsset?.assetLastError ?? null,
     note: latestRecord?.note ?? rawSubmission.note,
     statusLabel: rejected
       ? '거절됨'
       : countIncluded
-        ? '인증 완료'
+        ? assetStatus === SubmissionAssetStatus.ASSET_SAVED && !imageUrl
+          ? '이미지 URL 없음'
+          : '인증 완료'
         : latestAsset?.assetStatus === SubmissionAssetStatus.ASSET_FAILED
           ? '이미지 저장 실패'
           : latestAsset?.assetStatus === SubmissionAssetStatus.PROCESSING
-          ? '이미지 처리중'
-          : '처리중',
-    assetLabel: getAssetLabel(assetStatus, latestAsset?.assetLastError ?? null),
+            ? '이미지 처리중'
+            : assetStatus === SubmissionAssetStatus.ASSET_SAVED && !imageUrl
+              ? '이미지 URL 없음'
+            : '처리중',
+    assetLabel: getAssetLabel(assetStatus, latestAsset?.assetLastError ?? null, imageUrl),
     source: 'raw_submission',
     rawSubmissionId: rawSubmission.id,
     recordId: latestRecord?.id ?? undefined,
@@ -261,6 +278,7 @@ function buildChangeCandidateItem(candidate: TimelineChangeCandidate): CheckInTi
   const assetStatus = candidate.blobUrl
     ? SubmissionAssetStatus.ASSET_SAVED
     : SubmissionAssetStatus.PENDING;
+  const imageUrl = sanitizeBrowserImageUrl(candidate.blobUrl);
 
   return {
     id: `candidate-${candidate.id}`,
@@ -273,17 +291,28 @@ function buildChangeCandidateItem(candidate: TimelineChangeCandidate): CheckInTi
     duplicate: true,
     rejected: false,
     assetStatus,
-    imageUrl: candidate.blobUrl,
+    imageUrl,
+    imageUrlHost: getUrlHost(imageUrl),
+    originalPhotoUrl: candidate.originalPhotoUrl ?? candidate.slackOriginalUrl ?? null,
+    retryCount: 0,
+    lastError: null,
     note: candidate.note,
     statusLabel: '카운트 제외',
-    assetLabel: getAssetLabel(assetStatus, null),
+    assetLabel: getAssetLabel(assetStatus, null, imageUrl),
     source: 'change_candidate',
     candidateId: candidate.id,
   };
 }
 
-function getAssetLabel(status: SubmissionAssetStatus | 'NONE', lastError: string | null) {
+function getAssetLabel(
+  status: SubmissionAssetStatus | 'NONE',
+  lastError: string | null,
+  imageUrl: string | null,
+) {
   if (status === SubmissionAssetStatus.ASSET_SAVED) {
+    if (!imageUrl) {
+      return '이미지 URL 없음';
+    }
     return '이미지 저장 완료';
   }
   if (status === SubmissionAssetStatus.PROCESSING) {
@@ -296,6 +325,35 @@ function getAssetLabel(status: SubmissionAssetStatus | 'NONE', lastError: string
     return '이미지 처리중';
   }
   return '이미지 없음';
+}
+
+function sanitizeBrowserImageUrl(url?: string | null) {
+  const host = getUrlHost(url);
+  if (!url || !host) {
+    return null;
+  }
+
+  if (isSlackPrivateHost(host)) {
+    return null;
+  }
+
+  return url;
+}
+
+function getUrlHost(url?: string | null) {
+  if (!url) {
+    return null;
+  }
+
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
+function isSlackPrivateHost(host: string) {
+  return host === 'files.slack.com' || host.endsWith('.slack.com') || host.includes('slack.com');
 }
 
 async function loadIntegration(workspaceId?: string, channelId?: string): Promise<TimelineIntegration | null> {

@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { getCheckInTimeline } from '@/lib/services/check-in-timeline';
+import { TimelineImage } from './timeline-image';
 
 export const dynamic = 'force-dynamic';
 
@@ -175,50 +176,14 @@ export default async function CheckInsPage() {
                       alignItems: 'stretch',
                     }}
                   >
-                    <div
-                      style={{
-                        minHeight: 220,
-                        borderRadius: 20,
-                        overflow: 'hidden',
-                        background: '#eff4ed',
-                        border: '1px solid #dbe4d7',
-                        position: 'relative',
-                      }}
-                    >
-                      {item.imageUrl ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={item.imageUrl}
-                          alt={`${item.displayName} 인증 이미지`}
-                          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-                        />
-                      ) : (
-                        <div
-                          style={{
-                            width: '100%',
-                            height: '100%',
-                            display: 'grid',
-                            placeItems: 'center',
-                            padding: 20,
-                            textAlign: 'center',
-                            color: '#617065',
-                            background:
-                              'linear-gradient(135deg, rgba(230, 238, 228, 0.8) 0%, rgba(246, 249, 244, 1) 100%)',
-                          }}
-                        >
-                          <div>
-                            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 8 }}>
-                              {item.rejected ? '거절됨' : item.assetStatus === 'ASSET_FAILED' ? '이미지 저장 실패' : '이미지 처리중'}
-                            </div>
-                            <div style={{ fontSize: 14, lineHeight: 1.6 }}>
-                              {item.rejected
-                                ? '거절된 항목은 이미지 없이 카드로 남습니다.'
-                                : '이미지가 저장되면 새로고침 시 카드에 표시됩니다.'}
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                    <TimelineImage
+                      displayName={item.displayName}
+                      assetStatus={item.assetStatus === 'NONE' ? 'NONE' : item.assetStatus}
+                      imageUrl={item.imageUrl}
+                      originalPhotoUrl={item.originalPhotoUrl}
+                      retryCount={item.retryCount}
+                      lastError={item.lastError}
+                    />
 
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                       <InfoPanel title="메모" value={item.note ?? '메모 없음'} />
@@ -231,6 +196,12 @@ export default async function CheckInsPage() {
                         title="원본"
                         value={item.source === 'raw_submission' ? item.rawSubmissionId ?? 'raw_submission' : item.candidateId ?? 'duplicate_candidate'}
                       />
+                      <InfoPanel title="assetStatus" value={item.assetStatus} />
+                      <InfoPanel title="imageUrl 존재" value={item.imageUrl ? 'true' : 'false'} />
+                      <InfoPanel title="imageUrl host" value={item.imageUrlHost ?? '없음'} />
+                      <InfoPanel title="originalPhotoUrl 존재" value={item.originalPhotoUrl ? 'true' : 'false'} />
+                      <InfoPanel title="retryCount" value={String(item.retryCount)} />
+                      <InfoPanel title="lastError" value={item.lastError ?? '없음'} />
                     </div>
                   </div>
                 </article>
