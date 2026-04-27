@@ -323,6 +323,10 @@ export async function updateSlackSubmissionAsset(input: {
   assetProcessedAt?: Date | null;
   assetNextRetryAt?: Date | null;
 }) {
+  const resolvedAssetStatus = input.blobUrl
+    ? SubmissionAssetStatus.ASSET_SAVED
+    : SubmissionAssetStatus.ASSET_FAILED;
+
   const updated = await prisma.submissionAsset.updateMany({
     where: {
       rawSubmissionId: input.rawSubmissionId,
@@ -334,15 +338,11 @@ export async function updateSlackSubmissionAsset(input: {
       originalUrl: input.blobUrl ?? input.slackOriginalUrl ?? undefined,
       originalPhotoUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
       slackOriginalUrl: input.slackOriginalUrl ?? input.blobUrl ?? undefined,
-      assetStatus:
-        input.assetStatus ??
-        (input.uploadFailed
-          ? SubmissionAssetStatus.ASSET_FAILED
-          : input.blobUrl
-            ? SubmissionAssetStatus.ASSET_SAVED
-            : SubmissionAssetStatus.PENDING),
+      assetStatus: resolvedAssetStatus,
       assetRetryCount: input.assetRetryCount ?? undefined,
-      assetLastError: input.assetLastError ?? (input.uploadFailed ? 'asset_upload_failed' : null),
+      assetLastError:
+        input.assetLastError ??
+        (input.blobUrl ? null : input.uploadFailed ? 'asset_upload_failed' : 'missing_public_image_url'),
       assetLockedAt: input.assetLockedAt ?? null,
       assetProcessedAt:
         input.assetProcessedAt ??

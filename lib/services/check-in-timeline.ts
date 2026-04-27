@@ -228,10 +228,12 @@ export async function getCheckInTimeline(input: {
 function buildRawSubmissionItem(rawSubmission: TimelineRawSubmission): CheckInTimelineItem {
   const latestRecord = rawSubmission.checkInRecords[0] ?? null;
   const latestAsset = rawSubmission.assets[0] ?? null;
-  const assetStatus =
-    latestAsset?.assetStatus ??
-    (latestAsset?.blobUrl ? SubmissionAssetStatus.ASSET_SAVED : SubmissionAssetStatus.PENDING);
   const imageUrl = sanitizeBrowserImageUrl(latestAsset?.blobUrl);
+  const assetStatus = resolveDisplayAssetStatus(
+    latestAsset?.assetStatus,
+    imageUrl,
+    latestAsset?.assetLastError ?? null,
+  );
 
   const rejected = latestRecord?.status === CheckInRecordStatus.REJECTED;
   const countIncluded = latestRecord?.status === CheckInRecordStatus.APPROVED;
@@ -275,10 +277,12 @@ function buildRawSubmissionItem(rawSubmission: TimelineRawSubmission): CheckInTi
 
 function buildChangeCandidateItem(candidate: TimelineChangeCandidate): CheckInTimelineItem {
   const slackUserId = candidate.user.identities[0]?.providerUserId ?? null;
-  const assetStatus = candidate.blobUrl
-    ? SubmissionAssetStatus.ASSET_SAVED
-    : SubmissionAssetStatus.PENDING;
   const imageUrl = sanitizeBrowserImageUrl(candidate.blobUrl);
+  const assetStatus = resolveDisplayAssetStatus(
+    candidate.blobUrl ? SubmissionAssetStatus.ASSET_SAVED : SubmissionAssetStatus.PENDING,
+    imageUrl,
+    null,
+  );
 
   return {
     id: `candidate-${candidate.id}`,
@@ -325,6 +329,26 @@ function getAssetLabel(
     return '이미지 처리중';
   }
   return '이미지 없음';
+}
+
+function resolveDisplayAssetStatus(
+  status: SubmissionAssetStatus | null | undefined,
+  imageUrl: string | null,
+  lastError: string | null,
+): SubmissionAssetStatus | 'NONE' {
+  if (!status) {
+    return imageUrl ? SubmissionAssetStatus.ASSET_SAVED : SubmissionAssetStatus.PENDING;
+  }
+
+  if (status === SubmissionAssetStatus.ASSET_SAVED && !imageUrl) {
+    return SubmissionAssetStatus.ASSET_FAILED;
+  }
+
+  if (status === SubmissionAssetStatus.ASSET_FAILED && !lastError && !imageUrl) {
+    return SubmissionAssetStatus.ASSET_FAILED;
+  }
+
+  return status;
 }
 
 function sanitizeBrowserImageUrl(url?: string | null) {
